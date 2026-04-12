@@ -121,7 +121,8 @@ async function opencodeCliCall(
 
 /**
  * Extracts assistant text from opencode --format json event stream.
- * Each line is a JSON event; accumulates text from message.part.updated events.
+ * CLI format (opencode run --format json): each line is a JSON event.
+ * Text events have: { "type": "text", "part": { "type": "text", "text": "..." } }
  * Falls back to raw stdout if no structured events are found.
  */
 export function extractOpencodeText(output: string): string {
@@ -131,12 +132,13 @@ export function extractOpencodeText(output: string): string {
   for (const line of lines) {
     try {
       const event = JSON.parse(line);
+      // CLI event format: { type: "text", part: { type: "text", text: "..." } }
       if (
-        event.type === 'message.part.updated' &&
-        event.properties?.part?.type === 'text' &&
-        typeof event.properties.part.text === 'string'
+        event.type === 'text' &&
+        event.part?.type === 'text' &&
+        typeof event.part.text === 'string'
       ) {
-        parts.push(event.properties.part.text);
+        parts.push(event.part.text);
       }
     } catch {
       // non-JSON line — skip

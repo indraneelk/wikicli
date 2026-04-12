@@ -14,21 +14,24 @@ describe('OPENCODE_FREE_MODELS', () => {
   });
 });
 
+// Actual opencode CLI --format json event format (verified against opencode 1.2.27):
+// { "type": "text", "part": { "type": "text", "text": "..." }, ... }
 describe('extractOpencodeText', () => {
-  it('extracts text from message.part.updated events', () => {
+  it('extracts text from CLI text events', () => {
     const output = [
-      '{"type":"session.created","properties":{"id":"s1"}}',
-      '{"type":"message.part.updated","properties":{"part":{"type":"text","text":"Hello "}}}',
-      '{"type":"message.part.updated","properties":{"part":{"type":"text","text":"world"}}}',
-      '{"type":"session.idle","properties":{"sessionID":"s1"}}',
+      '{"type":"step_start","timestamp":1,"sessionID":"s1","part":{"type":"step-start"}}',
+      '{"type":"text","timestamp":2,"sessionID":"s1","part":{"id":"p1","type":"text","text":"Hello "}}',
+      '{"type":"text","timestamp":3,"sessionID":"s1","part":{"id":"p2","type":"text","text":"world"}}',
+      '{"type":"step_finish","timestamp":4,"sessionID":"s1","part":{"type":"step-finish","reason":"stop"}}',
     ].join('\n');
     assert.equal(extractOpencodeText(output), 'Hello world');
   });
 
-  it('ignores non-text part types', () => {
+  it('ignores non-text event types', () => {
     const output = [
-      '{"type":"message.part.updated","properties":{"part":{"type":"tool-invocation","toolName":"read"}}}',
-      '{"type":"message.part.updated","properties":{"part":{"type":"text","text":"Result"}}}',
+      '{"type":"step_start","part":{"type":"step-start"}}',
+      '{"type":"text","part":{"type":"text","text":"Result"}}',
+      '{"type":"step_finish","part":{"type":"step-finish"}}',
     ].join('\n');
     assert.equal(extractOpencodeText(output), 'Result');
   });
@@ -45,7 +48,7 @@ describe('extractOpencodeText', () => {
   it('handles malformed JSON lines gracefully', () => {
     const output = [
       'not json at all',
-      '{"type":"message.part.updated","properties":{"part":{"type":"text","text":"OK"}}}',
+      '{"type":"text","part":{"type":"text","text":"OK"}}',
     ].join('\n');
     assert.equal(extractOpencodeText(output), 'OK');
   });
