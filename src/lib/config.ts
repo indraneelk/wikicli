@@ -9,7 +9,7 @@ export interface WikicConfig {
   sources_dir: string;
   output_dir: string;
   llm: {
-    provider: "claude-cli" | "anthropic" | "openai" | "ollama";
+    provider: "claude-cli" | "anthropic" | "openai" | "ollama" | "opencode-cli";
     model?: string;
   };
   compiler: {
@@ -17,6 +17,9 @@ export interface WikicConfig {
     summary_max_tokens: number;
     article_max_tokens: number;
     auto_lint: boolean;
+    chunk_threshold: number;
+    chunk_size: number;
+    min_chunk_size: number;
   };
 }
 
@@ -34,11 +37,18 @@ const DEFAULT_CONFIG: WikicConfig = {
     summary_max_tokens: 2000,
     article_max_tokens: 4000,
     auto_lint: true,
+    chunk_threshold: 12000,
+    chunk_size: 8000,
+    min_chunk_size: 1500,
   },
 };
 
 export function getDefaultConfig(): WikicConfig {
-  return { ...DEFAULT_CONFIG };
+  return {
+    ...DEFAULT_CONFIG,
+    llm: { ...DEFAULT_CONFIG.llm },
+    compiler: { ...DEFAULT_CONFIG.compiler },
+  };
 }
 
 export function loadConfig(dir: string = process.cwd()): WikicConfig {
@@ -50,7 +60,12 @@ export function loadConfig(dir: string = process.cwd()): WikicConfig {
   }
   const raw = readFileSync(configPath, "utf-8");
   const parsed = parseYaml(raw);
-  return { ...DEFAULT_CONFIG, ...parsed };
+  return {
+    ...DEFAULT_CONFIG,
+    ...parsed,
+    llm: { ...DEFAULT_CONFIG.llm, ...parsed?.llm },
+    compiler: { ...DEFAULT_CONFIG.compiler, ...parsed?.compiler },
+  };
 }
 
 export function configToYaml(config: WikicConfig): string {
@@ -70,6 +85,9 @@ export function configToYaml(config: WikicConfig): string {
     `  summary_max_tokens: ${config.compiler.summary_max_tokens}`,
     `  article_max_tokens: ${config.compiler.article_max_tokens}`,
     `  auto_lint: ${config.compiler.auto_lint}`,
+    `  chunk_threshold: ${config.compiler.chunk_threshold}`,
+    `  chunk_size: ${config.compiler.chunk_size}`,
+    `  min_chunk_size: ${config.compiler.min_chunk_size}`,
   ];
   return lines.join("\n") + "\n";
 }
