@@ -1,5 +1,6 @@
-import { execFile } from "child_process";
-import { loadConfig, WikicConfig } from "./config.js";
+import { execFile, spawn } from "child_process";
+import { loadConfig } from "./config.js";
+import type { WikicConfig } from "./config.js";
 
 export interface LLMResponse {
   text: string;
@@ -7,9 +8,16 @@ export interface LLMResponse {
   error?: string;
 }
 
+export const OPENCODE_FREE_MODELS = [
+  "opencode/big-pickle",
+  "opencode/minimax-m2-5-free",
+  "opencode/qwen3-6-plus-free",
+  "opencode/nemotron-3-super-free",
+] as const;
+
 /**
  * Call an LLM with a system prompt and user message.
- * Uses claude -p by default, but supports other providers.
+ * Supports claude-cli and opencode-cli providers.
  */
 export async function llmCall(
   systemPrompt: string,
@@ -22,11 +30,17 @@ export async function llmCall(
   switch (provider) {
     case "claude-cli":
       return claudeCliCall(systemPrompt, userMessage, cfg.llm.model);
+    case "opencode-cli":
+      return opencodeCliCall(
+        systemPrompt,
+        userMessage,
+        cfg.llm.model ?? OPENCODE_FREE_MODELS[0]
+      );
     default:
       return {
         text: "",
         ok: false,
-        error: `Provider "${provider}" not yet implemented. Use "claude-cli".`,
+        error: `Provider "${provider}" not yet implemented. Use "claude-cli" or "opencode-cli".`,
       };
   }
 }
@@ -38,21 +52,93 @@ async function claudeCliCall(
 ): Promise<LLMResponse> {
   const combinedPrompt = `${systemPrompt}\n\n---\n\n${userMessage}`;
   const args = ["-p", combinedPrompt, "--output-format", "text"];
-  if (model) {
-    args.push("--model", model);
-  }
+  if (model) args.push("--model", model);
 
   return new Promise((resolve) => {
-    execFile("claude", args, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
-      if (err) {
+    execFile(
+      "claude",
+      args,
+      { maxBuffer: 1024 * 1024 * 10 },
+      (err, stdout, stderr) => {
+        if (err) {
+          resolve({
+            text: "",
+            ok: false,
+            error: `claude CLI error: ${err.message}\n${stderr}`,
+          });
+        } else {
+          resolve({ text: stdout.trim(), ok: true });
+        }
+      }
+    );
+  });
+}
+
+async function opencodeCliCall(
+  systemPrompt: string,
+  userMessage: string,
+  model: string
+): Promise<LLMResponse> {
+  const combinedPrompt = `${systemPrompt}\n\n---\n\n${userMessage}`;
+  const args = ["run", combinedPrompt, "--model", model, "--format", "json"];
+
+  return new Promise((resolve) => {
+    const child = spawn("opencode", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+    child.on("close", (code) => {
+      if (code !== 0) {
         resolve({
           text: "",
           ok: false,
-          error: `claude CLI error: ${err.message}\n${stderr}`,
+          error: `opencode error (exit ${code}): ${stderr.slice(0, 500)}`,
         });
-      } else {
-        resolve({ text: stdout.trim(), ok: true });
+        return;
       }
+      resolve({ text: extractOpencodeText(stdout).trim(), ok: true });
+    });
+
+    child.on("error", (err) => {
+      resolve({
+        text: "",
+        ok: false,
+        error: `opencode spawn error: ${err.message}`,
+      });
     });
   });
+}
+
+/**
+ * Extracts assistant text from opencode --format json event stream.
+ * Each line is a JSON event; accumulates text from message.part.updated events.
+ * Falls back to raw stdout if no structured events are found.
+ */
+export function extractOpencodeText(output: string): string {
+  const lines = output.split('\n').filter(l => l.trim());
+  const parts: string[] = [];
+
+  for (const line of lines) {
+    try {
+      const event = JSON.parse(line);
+      if (
+        event.type === 'message.part.updated' &&
+        event.properties?.part?.type === 'text' &&
+        typeof event.properties.part.text === 'string'
+      ) {
+        parts.push(event.properties.part.text);
+      }
+    } catch {
+      // non-JSON line — skip
+    }
+  }
+
+  if (parts.length > 0) return parts.join('');
+  return output; // fallback: return raw stdout
 }
