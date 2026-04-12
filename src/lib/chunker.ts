@@ -10,11 +10,11 @@ export function chunkContent(
   const sections = splitIntoSections(content);
 
   if (sections.length <= 1) {
-    return splitByParagraph(content, maxChars);
+    return mergeTiny(splitByParagraph(content, maxChars), minChars, maxChars);
   }
 
   const raw = accumulateSections(sections, maxChars);
-  return mergeTiny(raw, minChars);
+  return mergeTiny(raw, minChars, maxChars);
 }
 
 function splitIntoSections(content: string): string[] {
@@ -72,14 +72,17 @@ function splitByParagraph(content: string, maxChars: number): string[] {
   return chunks;
 }
 
-function mergeTiny(chunks: string[], minChars: number): string[] {
+function mergeTiny(chunks: string[], minChars: number, maxChars: number): string[] {
   const result: string[] = [];
   for (const chunk of chunks) {
     if (chunk.length < minChars && result.length > 0) {
-      result[result.length - 1] += '\n' + chunk;
-    } else {
-      result.push(chunk);
+      const merged = result[result.length - 1] + '\n' + chunk;
+      if (merged.length <= maxChars) {
+        result[result.length - 1] = merged;
+        continue;
+      }
     }
+    result.push(chunk);
   }
   return result;
 }

@@ -46,6 +46,23 @@ describe('chunkContent', () => {
     assert.ok(result[1].startsWith('PART II'));
   });
 
+  it('accumulates multiple sections into one chunk when combined size fits', () => {
+    // Each section is ~5000 chars individually (under 8000 limit)
+    // but two together are ~10000 chars (over limit) so they must be split
+    const section1 = '# Section A\n\n' + 'word '.repeat(1000); // ~5000 chars
+    const section2 = '# Section B\n\n' + 'word '.repeat(1000); // ~5000 chars
+    const section3 = '# Section C\n\n' + 'word '.repeat(200);  // ~1000 chars
+    // section1 + section2 = ~10000 > 8000 → two separate chunks
+    // section2 + section3 = ~6000 < 8000 → merged into one chunk
+    const content = section1 + '\n' + section2 + '\n' + section3;
+    const result = chunkContent(content, 8000, 1500);
+    // section1 alone, then section2+section3 merged
+    assert.equal(result.length, 2);
+    assert.ok(result[0].includes('# Section A'));
+    assert.ok(result[1].includes('# Section B'));
+    assert.ok(result[1].includes('# Section C'));
+  });
+
   it('merges accumulated sections when they fit within maxChars', () => {
     const s1 = '# A\n\n' + 'x '.repeat(500); // ~1000 chars
     const s2 = '# B\n\n' + 'x '.repeat(500);
