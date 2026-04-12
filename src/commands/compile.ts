@@ -5,7 +5,7 @@ import { loadManifest, saveManifest, upsertConcept } from "../lib/manifest.js";
 import { hashFile } from "../lib/hash.js";
 import { readText, writeText, ensureDir, listMarkdownFiles } from "../lib/files.js";
 import { slugify } from "../lib/slug.js";
-import { llmCall } from "../lib/llm.js";
+import { llmCall, OPENCODE_FREE_MODELS } from "../lib/llm.js";
 import { SUMMARIZE_SYSTEM, buildSummarizePrompt } from "../prompts/summarize.js";
 import { EXTRACT_SYSTEM, buildExtractPrompt } from "../prompts/extract.js";
 import { WRITE_SYSTEM, buildWritePrompt } from "../prompts/write.js";
@@ -110,9 +110,18 @@ async function summarizeSource(
 export const compileCommand = new Command("compile")
   .description("Compile sources into wiki articles")
   .option("--full", "Force full recompilation")
+  .option(
+    "--model <id>",
+    "Override LLM model for this run (does not modify config.yaml).\n" +
+    "Free opencode models:\n" +
+    OPENCODE_FREE_MODELS.map((m) => `  ${m}`).join("\n")
+  )
   .action(async (opts) => {
     const dir = process.cwd();
-    const config = loadConfig(dir);
+    const baseConfig = loadConfig(dir);
+    const config = opts.model
+      ? { ...baseConfig, llm: { ...baseConfig.llm, model: opts.model as string } }
+      : baseConfig;
     const manifest = loadManifest(dir);
     const stats: CompileStats = {
       sources_added: 0,
