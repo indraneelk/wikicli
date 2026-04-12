@@ -36,6 +36,7 @@ async function runParallel<T, R>(
   let next = 0;
 
   async function worker(): Promise<void> {
+    // Safe: JS is single-threaded; `next++` is atomic across awaits.
     while (next < items.length) {
       const i = next++;
       results[i] = await fn(items[i], i);
@@ -55,7 +56,7 @@ async function summarizeSource(
   content: string,
   config: import("../lib/config.js").WikicConfig,
   dir: string
-): Promise<{ ok: boolean; summaryPath?: string; error?: string }> {
+): Promise<{ ok: true; summaryPath: string } | { ok: false; error?: string }> {
   const summaryFileName =
     sourcePath.replace(/^.*\//, "").replace(/\.md$/, "") + ".md";
   const summaryPath = join(config.output_dir, "summaries", summaryFileName);
