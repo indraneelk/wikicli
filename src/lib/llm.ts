@@ -10,8 +10,7 @@ export interface LLMResponse {
 
 export const OPENCODE_FREE_MODELS = [
   "opencode/big-pickle",
-  "opencode/minimax-m2-5-free",
-  "opencode/qwen3-6-plus-free",
+  "opencode/minimax-m2.5-free",
   "opencode/nemotron-3-super-free",
 ] as const;
 

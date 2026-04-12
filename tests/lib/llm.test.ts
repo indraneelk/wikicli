@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { OPENCODE_FREE_MODELS, extractOpencodeText } from '../../src/lib/llm.ts';
 
 describe('OPENCODE_FREE_MODELS', () => {
-  it('contains exactly 4 entries', () => {
-    assert.equal(OPENCODE_FREE_MODELS.length, 4);
+  it('contains exactly 3 entries', () => {
+    assert.equal(OPENCODE_FREE_MODELS.length, 3);
   });
 
   it('all entries start with opencode/', () => {
