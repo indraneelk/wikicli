@@ -8,7 +8,7 @@ import { register } from 'node:module';
 const loaderSrc = `
   export async function resolve(specifier, context, nextResolve) {
     if (specifier.endsWith('.js') && context.parentURL) {
-      const parentPath = context.parentURL.replace(/^file:\\/\\//, '');
+      const parentPath = new URL(context.parentURL).pathname;
       if (parentPath.includes('/src/') && parentPath.endsWith('.ts')) {
         const tsSpecifier = specifier.slice(0, -3) + '.ts';
         try {

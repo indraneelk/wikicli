@@ -80,6 +80,10 @@ async function opencodeCliCall(
   model: string
 ): Promise<LLMResponse> {
   const combinedPrompt = `${systemPrompt}\n\n---\n\n${userMessage}`;
+  // opencode CLI contract: `opencode run <prompt> --model <id> --format json`
+  // The prompt is passed as a single positional argument (no shell expansion via spawn).
+  // If the CLI changes to require stdin or a flag for the prompt, extractOpencodeText
+  // will fall back to raw stdout and output may be empty or unexpected.
   const args = ["run", combinedPrompt, "--model", model, "--format", "json"];
 
   return new Promise((resolve) => {
