@@ -9,6 +9,8 @@ import { llmCall } from "../lib/llm.js";
 import { SUMMARIZE_SYSTEM, buildSummarizePrompt } from "../prompts/summarize.js";
 import { EXTRACT_SYSTEM, buildExtractPrompt } from "../prompts/extract.js";
 import { WRITE_SYSTEM, buildWritePrompt } from "../prompts/write.js";
+import { chunkContent } from "../lib/chunker.js";
+import { MERGE_SYSTEM, buildMergePrompt } from "../prompts/merge.js";
 
 interface ExtractedConcept {
   name: string;
@@ -23,6 +25,85 @@ interface CompileStats {
   concepts_extracted: number;
   articles_written: number;
   errors: string[];
+}
+
+async function runParallel<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+
+  async function worker(): Promise<void> {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i], i);
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(concurrency, items.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+async function summarizeSource(
+  sourcePath: string,
+  content: string,
+  config: import("../lib/config.js").WikicConfig,
+  dir: string
+): Promise<{ ok: boolean; summaryPath?: string; error?: string }> {
+  const summaryFileName =
+    sourcePath.replace(/^.*\//, "").replace(/\.md$/, "") + ".md";
+  const summaryPath = join(config.output_dir, "summaries", summaryFileName);
+
+  if (content.length <= config.compiler.chunk_threshold) {
+    const resp = await llmCall(
+      SUMMARIZE_SYSTEM,
+      buildSummarizePrompt(sourcePath, content),
+      config
+    );
+    if (!resp.ok) return { ok: false, error: resp.error };
+    writeText(join(dir, summaryPath), resp.text);
+    return { ok: true, summaryPath };
+  }
+
+  const chunks = chunkContent(
+    content,
+    config.compiler.chunk_size,
+    config.compiler.min_chunk_size
+  );
+  console.error(`  ${sourcePath}: ${chunks.length} chunks, summarizing in parallel...`);
+
+  const chunkResults = await runParallel(
+    chunks,
+    config.compiler.max_parallel,
+    (chunk, i) =>
+      llmCall(
+        SUMMARIZE_SYSTEM,
+        buildSummarizePrompt(
+          `Chunk ${i + 1} of ${chunks.length} from: ${sourcePath}`,
+          chunk
+        ),
+        config
+      )
+  );
+
+  const failed = chunkResults.find((r) => !r.ok);
+  if (failed) return { ok: false, error: failed.error };
+
+  const mergeResp = await llmCall(
+    MERGE_SYSTEM,
+    buildMergePrompt(chunkResults.map((r) => r.text), sourcePath),
+    config
+  );
+  if (!mergeResp.ok) return { ok: false, error: mergeResp.error };
+
+  writeText(join(dir, summaryPath), mergeResp.text);
+  return { ok: true, summaryPath };
 }
 
 export const compileCommand = new Command("compile")
@@ -65,29 +146,23 @@ export const compileCommand = new Command("compile")
 
     console.error(`Compiling ${toProcess.length} source(s)...`);
 
-    // Step 2: Summarize
+    // Step 2: Summarize (with chunking for large files)
     const summariesDir = join(dir, config.output_dir, "summaries");
     ensureDir(summariesDir);
 
     for (const sourcePath of toProcess) {
       const content = readText(join(dir, sourcePath));
       console.error(`  Summarizing ${sourcePath}...`);
-      const resp = await llmCall(
-        SUMMARIZE_SYSTEM,
-        buildSummarizePrompt(sourcePath, content),
-        config
-      );
 
-      if (!resp.ok) {
-        stats.errors.push(`Summarize failed for ${sourcePath}: ${resp.error}`);
+      const result = await summarizeSource(sourcePath, content, config, dir);
+
+      if (!result.ok) {
+        stats.errors.push(`Summarize failed for ${sourcePath}: ${result.error}`);
         manifest.sources[sourcePath].status = "error";
         continue;
       }
 
-      const summaryFileName = sourcePath.replace(/^.*\//, "").replace(/\.md$/, "") + ".md";
-      const summaryPath = join(config.output_dir, "summaries", summaryFileName);
-      writeText(join(dir, summaryPath), resp.text);
-      manifest.sources[sourcePath].summary_path = summaryPath;
+      manifest.sources[sourcePath].summary_path = result.summaryPath ?? null;
       manifest.sources[sourcePath].compiled_at = new Date().toISOString();
       stats.summarized++;
     }
