@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { join } from "path";
 import { existsSync } from "fs";
 import { loadConfig } from "../lib/config.js";
-import { loadManifest } from "../lib/manifest.js";
+import { loadManifest, loadRelations, RELATION_TYPES, RelationType } from "../lib/manifest.js";
 import { readText, writeText } from "../lib/files.js";
 
 interface GraphNode {
@@ -14,16 +14,43 @@ interface GraphNode {
 interface GraphEdge {
   from: string;
   to: string;
+  type?: RelationType;
+  evidence?: string;
+}
+
+const EDGE_COLORS: Record<string, string> = {
+  contradicts: "#e74c3c",
+  cites: "#3498db",
+  implements: "#27ae60",
+  extends: "#27ae60",
+  optimizes: "#27ae60",
+  derived_from: "#27ae60",
+  trades_off: "#27ae60",
+  prerequisite_of: "#27ae60",
+};
+
+const DOT_EDGE_STYLES: Record<string, string> = {
+  contradicts: 'style=dashed,color="#e74c3c"',
+};
+
+function getEdgeStyle(type?: RelationType): string {
+  if (!type) return "";
+  const style = DOT_EDGE_STYLES[type];
+  if (style) return style;
+  const color = EDGE_COLORS[type];
+  return color ? `color="${color}"` : "";
 }
 
 export const graphCommand = new Command("graph")
   .description("Export concept graph as JSON, DOT, or HTML")
   .option("--format <fmt>", "Output format: json, dot, html", "json")
   .option("-o, --output <path>", "Write to file instead of stdout")
+  .option("--relations <type>", `Filter edges by relation type: ${RELATION_TYPES.join(", ")}`)
   .action((opts) => {
     const dir = process.cwd();
-    const config = loadConfig(dir);
+    loadConfig(dir);
     const manifest = loadManifest(dir);
+    const explicitRelations = loadRelations(dir);
 
     const knownSlugs = new Set(Object.keys(manifest.concepts));
     const nodes: GraphNode[] = [];
@@ -36,7 +63,6 @@ export const graphCommand = new Command("graph")
         sources: concept.sources,
       });
 
-      // Parse wikilinks from article
       const articlePath = join(dir, concept.article_path);
       if (!existsSync(articlePath)) continue;
 
@@ -50,12 +76,21 @@ export const graphCommand = new Command("graph")
       }
     }
 
-    // Deduplicate edges
-    const edgeSet = new Set(edges.map((e) => `${e.from}→${e.to}`));
-    const uniqueEdges = [...edgeSet].map((e) => {
-      const [from, to] = e.split("→");
-      return { from, to };
-    });
+    for (const r of explicitRelations) {
+      edges.push({ from: r.source, to: r.target, type: r.type, evidence: r.evidence });
+    }
+
+    const filteredEdges = opts.relations
+      ? edges.filter((e) => e.type === opts.relations)
+      : edges;
+
+    const uniqueEdges = filteredEdges.reduce<GraphEdge[]>((acc, e) => {
+      const key = `${e.from}→${e.to}→${e.type || ""}`;
+      if (!acc.find((a) => `${a.from}→${a.to}→${a.type || ""}` === key)) {
+        acc.push(e);
+      }
+      return acc;
+    }, []);
 
     let output: string;
 
@@ -84,13 +119,20 @@ function toDot(nodes: GraphNode[], edges: GraphEdge[]): string {
     lines.push(`  "${n.id}";`);
   }
   for (const e of edges) {
-    lines.push(`  "${e.from}" -> "${e.to}";`);
+    const style = getEdgeStyle(e.type);
+    const label = e.type ? `,label="${e.type}"` : "";
+    if (style) {
+      lines.push(`  "${e.from}" -> "${e.to}" [${style}${label}];`);
+    } else {
+      lines.push(`  "${e.from}" -> "${e.to}"${label ? ` [label="${e.type}"]` : ""};`);
+    }
   }
   lines.push("}");
   return lines.join("\n");
 }
 
 function toHtml(nodes: GraphNode[], edges: GraphEdge[]): string {
+  const edgeColorMap = JSON.stringify(EDGE_COLORS);
   const graphData = JSON.stringify({ nodes, edges });
   return `<!DOCTYPE html>
 <html>
@@ -102,13 +144,24 @@ function toHtml(nodes: GraphNode[], edges: GraphEdge[]): string {
 <body>
   <div id="graph"></div>
   <script>
+    const edgeColors = ${edgeColorMap};
     const data = ${graphData};
     const nodes = new vis.DataSet(data.nodes.map(n => ({ id: n.id, label: n.id })));
-    const edges = new vis.DataSet(data.edges.map((e, i) => ({ id: i, from: e.from, to: e.to, arrows: 'to' })));
+    const edges = new vis.DataSet(data.edges.map((e, i) => ({
+      id: i,
+      from: e.from,
+      to: e.to,
+      arrows: 'to',
+      color: e.type ? { color: edgeColors[e.type] || '#888' } : { color: '#888' },
+      dashes: e.type === 'contradicts',
+      title: e.type ? 'type: ' + e.type + (e.evidence ? '\\n' + e.evidence : '') : undefined,
+      label: e.type || undefined,
+      font: { color: '#333', size: 10 }
+    })));
     new vis.Network(document.getElementById('graph'), { nodes, edges }, {
       physics: { stabilization: { iterations: 200 } },
       nodes: { shape: 'box', margin: 10, font: { size: 14 } },
-      edges: { color: '#888', smooth: { type: 'cubicBezier' } }
+      edges: { smooth: { type: 'cubicBezier' } }
     });
   </script>
 </body>

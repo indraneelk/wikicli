@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { join } from "path";
 import { existsSync } from "fs";
 import { loadConfig } from "../lib/config.js";
-import { loadManifest } from "../lib/manifest.js";
+import { loadManifest, loadRelations, RelationEntry } from "../lib/manifest.js";
 import { readText, writeText, ensureDir } from "../lib/files.js";
 import { slugify } from "../lib/slug.js";
 import { llmCall } from "../lib/llm.js";
@@ -58,9 +58,18 @@ export const queryCommand = new Command("query")
       }
     }
 
+    const topPageSlugs = new Set(topPages.map((p) => p.slug));
+    const relations = loadRelations(dir);
+    const contradictions = relations.filter(
+      (r): r is RelationEntry =>
+        r.type === "contradicts" &&
+        topPageSlugs.has(r.source) &&
+        topPageSlugs.has(r.target)
+    );
+
     const resp = await llmCall(
       QUERY_SYSTEM,
-      buildQueryPrompt(question, wikiContent.join("\n\n")),
+      buildQueryPrompt(question, wikiContent.join("\n\n"), contradictions),
       config
     );
 
@@ -73,6 +82,16 @@ export const queryCommand = new Command("query")
       ok: true,
       answer: resp.text,
       pages_used: topPages.map((p) => p.slug),
+      conflicts:
+        contradictions.length > 0
+          ? contradictions.map((c) => ({
+              between: [c.source, c.target],
+              summary:
+                c.evidence ||
+                `Articles [[${c.source}]] and [[${c.target}]] have contradictory claims`,
+              severity: "medium",
+            }))
+          : undefined,
     };
 
     if (opts.save) {

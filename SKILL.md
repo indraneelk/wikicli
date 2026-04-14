@@ -43,7 +43,27 @@ wikic lint
 
 No LLM. Returns JSON with broken wikilinks, missing fields, orphaned concepts, duplicates.
 
-### 4. Auto-fix issues
+### 4b. Detect contradictions
+
+```bash
+wikic lint --contradictions           # detect contradictions between articles
+wikic lint --contradictions --skip-llm   # fast check (no LLM, only candidates)
+wikic lint --contradictions --fix     # auto-resolve conflicts
+```
+
+Uses shared-source analysis + LLM verification to find contradictory claims between wiki articles. Adds typed `contradicts` edges to the knowledge graph.
+
+### 4c. Knowledge graph
+
+```bash
+wikic graph                        # JSON: nodes + typed edges
+wikic graph --relations contradicts   # filter to contradiction edges only
+wikic graph --format html -o graph.html
+```
+
+Exports the concept graph with typed relations (implements, extends, contradicts, cites, etc.). Use `--relations <type>` to filter by relation type.
+
+### 5. Auto-fix issues
 
 ```bash
 wikic heal
@@ -94,6 +114,7 @@ Removes source file, its summary, and any orphaned concepts (concepts that only 
 wikic graph                          # JSON to stdout
 wikic graph --format dot -o graph.dot   # Graphviz DOT
 wikic graph --format html -o graph.html # Interactive vis.js HTML
+wikic graph --relations contradicts     # filter to contradictions
 ```
 
 ## Reading Wiki Content
@@ -107,8 +128,8 @@ aliases: ["alt names"]
 sources: ["sources/file.md"]
 confidence: high|medium
 tags: ["tag1", "tag2"]
+conflicts_with: ["related-concept-slug"]
 ---
-```
 
 Sections: Definition, How it Works, Variants, Trade-offs, See Also.
 

@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import { join } from "path";
 import { loadConfig } from "../lib/config.js";
-import { loadManifest, saveManifest, upsertConcept } from "../lib/manifest.js";
+import { loadManifest, saveManifest, upsertConcept, upsertRelation, loadRelations, saveRelations } from "../lib/manifest.js";
 import { hashFile } from "../lib/hash.js";
 import { readText, writeText, ensureDir, listMarkdownFiles } from "../lib/files.js";
 import { slugify } from "../lib/slug.js";
@@ -9,6 +9,7 @@ import { llmCall, OPENCODE_FREE_MODELS } from "../lib/llm.js";
 import { SUMMARIZE_SYSTEM, buildSummarizePrompt } from "../prompts/summarize.js";
 import { EXTRACT_SYSTEM, buildExtractPrompt } from "../prompts/extract.js";
 import { WRITE_SYSTEM, buildWritePrompt } from "../prompts/write.js";
+import { RELATE_SYSTEM, buildRelatePrompt } from "../prompts/relate.js";
 import { chunkContent } from "../lib/chunker.js";
 import { MERGE_SYSTEM, buildMergePrompt } from "../prompts/merge.js";
 
@@ -24,6 +25,7 @@ interface CompileStats {
   summarized: number;
   concepts_extracted: number;
   articles_written: number;
+  relations_extracted: number;
   errors: string[];
 }
 
@@ -123,12 +125,14 @@ export const compileCommand = new Command("compile")
       ? { ...baseConfig, llm: { ...baseConfig.llm, model: opts.model as string } }
       : baseConfig;
     const manifest = loadManifest(dir);
+    const relations = loadRelations(dir);
     const stats: CompileStats = {
       sources_added: 0,
       sources_modified: 0,
       summarized: 0,
       concepts_extracted: 0,
       articles_written: 0,
+      relations_extracted: 0,
       errors: [],
     };
 
@@ -259,6 +263,31 @@ export const compileCommand = new Command("compile")
       }
 
       writeText(join(dir, articlePath), resp.text);
+
+      const relateResp = await llmCall(
+        RELATE_SYSTEM,
+        buildRelatePrompt(concept.name, slug, sourceMaterial.join("\n\n"), allSlugs),
+        config
+      );
+
+      if (relateResp.ok) {
+        try {
+          let jsonStr = relateResp.text.trim();
+          if (jsonStr.startsWith("```")) {
+            jsonStr = jsonStr.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+          }
+          const parsed = JSON.parse(jsonStr) as Array<{ target: string; type: string; evidence?: string }>;
+          for (const rel of parsed) {
+            upsertRelation(manifest, relations, slug, rel.target, rel.type as import("../lib/manifest.js").RelationType, rel.evidence ?? "");
+            stats.relations_extracted++;
+          }
+        } catch {
+          stats.errors.push(`Failed to parse relations for ${slug}: ${relateResp.text.slice(0, 200)}`);
+        }
+      } else {
+        stats.errors.push(`Relation extraction failed for ${slug}: ${relateResp.error}`);
+      }
+
       upsertConcept(manifest, slug, sources[0], articlePath, concept.aliases);
       manifest.concepts[slug].last_compiled = new Date().toISOString();
 
@@ -287,6 +316,7 @@ export const compileCommand = new Command("compile")
       }
     }
 
+    saveRelations(dir, relations);
     saveManifest(dir, manifest);
 
     console.log(JSON.stringify({ ok: true, ...stats }));
@@ -374,6 +404,7 @@ function appendChangelog(dir: string, outputDir: string, stats: CompileStats): v
 - Summarized: ${stats.summarized}
 - Concepts extracted: ${stats.concepts_extracted}
 - Articles written: ${stats.articles_written}
+- Relations extracted: ${stats.relations_extracted}
 - Errors: ${stats.errors.length}
 ${stats.errors.length > 0 ? stats.errors.map((e) => `  - ${e}`).join("\n") : ""}
 `;
