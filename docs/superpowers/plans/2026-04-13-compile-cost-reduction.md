@@ -1,10 +1,12 @@
-# Compile Pipeline Cost Reduction Implementation Plan
+# Compile Pipeline Cost Reduction + Contradiction-Aware Compilation
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Reduce LLM calls by ~50% by combining write+relate into one prompt per concept, combining summarize+extract into one prompt per source, eliminating the merge LLM call for large sources, and parallelising article writes.
+**Goal Part 1:** Reduce LLM calls by ~50% by combining write+relate into one prompt per concept, combining summarize+extract into one prompt per source, eliminating the merge LLM call for large sources, and parallelising article writes.
 
-**Architecture:** Two new prompt files replace four old ones (`writeAndRelate.ts` replaces `write.ts`+`relate.ts`; `summarizeAndExtract.ts` replaces `summarize.ts`+`extract.ts`+`merge.ts`). Both use a sentinel comment (`<!-- X_JSON ... -->`) to embed JSON inside Markdown output — the parser splits on the sentinel. `summarizeSource()` returns extracted concepts alongside the summary path, removing the need for a separate extract LLM phase. Large sources skip the merge LLM call entirely — chunk concepts are merged in code. Article writes move from a sequential for-loop to `runParallel`.
+**Goal Part 2:** Make contradiction detection a first-class post-compile step. Every compile run surfaces updated contradiction candidates for human review. High-confidence verified contradictions get written to the graph; pending ones go to a review queue.
+
+**Architecture:** Two new prompt files replace four old ones (`writeAndRelate.ts` replaces `write.ts`+`relate.ts`; `summarizeAndExtract.ts` replaces `summarize.ts`+`extract.ts`+`merge.ts`). Both use a sentinel comment (`<!-- X_JSON ... -->`) to embed JSON inside Markdown output. A new `wikic contradictions` command provides a human-review workflow. Post-compile runs `lint --contradictions` automatically, with incremental checking making it nearly free on unchanged content.
 
 **Tech Stack:** TypeScript ESM (Node16 module resolution), Node 22, `node:test`. Test command: `node --experimental-strip-types --import ./tests/loader.mjs --test 'tests/**/*.test.ts'`. Build: `npm run build` (tsc).
 
@@ -18,6 +20,7 @@
 | Large source (N chunks) | N chunk-summarize + 1 merge + 1 extract = **N+2** | N chunk-summarize+extract = **N** | -2 calls |
 | Per concept | 1 write + 1 relate = **2** | 1 write+relate = **1** | -50% |
 | **Typical run** (5 sources avg 2 chunks, 10 concepts) | **40** | **20** | **-50%** |
+| Post-compile contradiction check | 0 (manual) | candidates + LLM verification (incremental) | depends on pairs |
 
 ---
 
@@ -26,19 +29,28 @@
 **Create:**
 - `src/prompts/writeAndRelate.ts` — combined write+relate system prompt, user prompt builder, sentinel parser
 - `src/prompts/summarizeAndExtract.ts` — combined summarize+extract system prompt, user prompt builder, sentinel parser
+- `src/commands/contradictions.ts` — human review command: `wikic contradictions`, `wikic contradictions --review <pair>`, `wikic contradictions --export`
 - `tests/prompts/writeAndRelate.test.ts` — 6 unit tests for the parser
 - `tests/prompts/summarizeAndExtract.test.ts` — 6 unit tests for the parser
 - `tests/lib/compile.test.ts` — 5 unit tests for `mergeExtractedConcepts`
+- `tests/commands/contradictions.test.ts` — integration tests for the contradictions command
 
 **Modify:**
-- `src/commands/compile.ts` — rewrite `summarizeSource()`, export `mergeExtractedConcepts`, remove extract phase, replace write+relate loop with parallel `writeAndRelate` calls, remove old prompt imports
+- `src/commands/compile.ts` — rewrite `summarizeSource()`, export `mergeExtractedConcepts`, remove extract phase, replace write+relate loop with parallel `writeAndRelate`, add post-compile contradiction check
+- `src/index.ts` — register `contradictionsCommand`
+- `src/commands/lint.ts` — expose contradiction functions so `compile` can call them; add `--export-candidates <path>` flag
 
 **Keep (not imported after this plan, left as reference):**
 - `src/prompts/summarize.ts`, `src/prompts/extract.ts`, `src/prompts/write.ts`, `src/prompts/relate.ts`, `src/prompts/merge.ts`
 
+**Deleted (replaced):**
+- `src/prompts/relate.ts` — replaced by `writeAndRelate.ts`
+
 ---
 
-## Task 1: Create `writeAndRelate.ts` — combined prompt and parser
+## LLM Call Reduction Tasks (1-6)
+
+### Task 1: Create `writeAndRelate.ts` — combined prompt and parser
 
 **Files:**
 - Create: `src/prompts/writeAndRelate.ts`
@@ -192,7 +204,7 @@ Rules for RELATIONS_JSON:
 - evidence: 1-2 sentence excerpt from source material supporting the relationship
 - Return [] if no meaningful relations found
 - The JSON must be valid — double-check brackets and quotes before outputting
-\`;
+`;
 
 export function buildWriteAndRelatePrompt(
   conceptName: string,
@@ -203,20 +215,20 @@ export function buildWriteAndRelatePrompt(
   sourceContent: string,
   existingConcepts: string[]
 ): string {
-  return \`Write a wiki article and extract relationships for this concept.
+  return `Write a wiki article and extract relationships for this concept.
 
-Concept: \${conceptName}
-Slug: \${slug}
-Aliases: \${JSON.stringify(aliases)}
-Sources: \${JSON.stringify(sources)}
-Confidence: \${confidence}
-Timestamp: \${new Date().toISOString()}
+Concept: ${conceptName}
+Slug: ${slug}
+Aliases: ${JSON.stringify(aliases)}
+Sources: ${JSON.stringify(sources)}
+Confidence: ${confidence}
+Timestamp: ${new Date().toISOString()}
 
-Known concepts (for wikilinks): \${existingConcepts.join(', ')}
+Known concepts (for wikilinks): ${existingConcepts.join(', ')}
 
 --- SOURCE MATERIAL ---
-\${sourceContent}
---- END SOURCE MATERIAL ---\`;
+${sourceContent}
+--- END SOURCE MATERIAL ---`;
 }
 
 export function parseWriteAndRelateResponse(text: string): WriteAndRelateResult {
@@ -254,7 +266,7 @@ git commit -m "feat: add writeAndRelate combined prompt and parser"
 
 ---
 
-## Task 2: Create `summarizeAndExtract.ts` — combined prompt and parser
+### Task 2: Create `summarizeAndExtract.ts` — combined prompt and parser
 
 **Files:**
 - Create: `src/prompts/summarizeAndExtract.ts`
@@ -400,20 +412,20 @@ Rules for CONCEPTS_JSON:
 - aliases: alternative names, acronyms, or shorter forms
 - Do NOT extract vague concepts like "Overview" or "Summary"
 - The JSON must be valid — double-check brackets and quotes before outputting
-\`;
+`;
 
 export function buildSummarizeAndExtractPrompt(
   sourcePath: string,
   content: string
 ): string {
-  return \`Summarize this document and extract concepts from it.
+  return `Summarize this document and extract concepts from it.
 
-Source path: \${sourcePath}
-Current timestamp: \${new Date().toISOString()}
+Source path: ${sourcePath}
+Current timestamp: ${new Date().toISOString()}
 
 --- DOCUMENT START ---
-\${content}
---- DOCUMENT END ---\`;
+${content}
+--- DOCUMENT END ---`;
 }
 
 export function parseSummarizeAndExtractResponse(text: string): SummarizeAndExtractResult {
@@ -451,7 +463,7 @@ git commit -m "feat: add summarizeAndExtract combined prompt and parser"
 
 ---
 
-## Task 3: Export `mergeExtractedConcepts` and rewrite `summarizeSource()`
+### Task 3: Export `mergeExtractedConcepts` and rewrite `summarizeSource()`
 
 **Files:**
 - Modify: `src/commands/compile.ts`
@@ -571,7 +583,7 @@ export function mergeExtractedConcepts(
 
 - [ ] **Step 5: Replace the entire `summarizeSource` function**
 
-Replace the current `summarizeSource` function (lines 56–110) with:
+Replace the current `summarizeSource` function with:
 
 ```typescript
 async function summarizeSource(
@@ -661,7 +673,7 @@ git commit -m "refactor: rewrite summarizeSource with combined prompt, export me
 
 ---
 
-## Task 4: Remove separate extract phase; populate `allConcepts` from `summarizeSource`
+### Task 4: Remove separate extract phase; populate `allConcepts` from `summarizeSource`
 
 **Files:**
 - Modify: `src/commands/compile.ts` (action handler Step 2 and Step 3)
@@ -670,7 +682,7 @@ git commit -m "refactor: rewrite summarizeSource with combined prompt, export me
 
 - [ ] **Step 1: In the `action` handler replace the two-phase block**
 
-Find and delete the "Step 3: Extract concepts from summaries" block (currently lines ~184-222 in compile.ts). Then replace the "Step 2: Summarize" block with this combined block:
+Find and delete the "Step 3: Extract concepts from summaries" block. Then replace the "Step 2: Summarize" block with this combined block:
 
 ```typescript
 // Step 2: Summarise + extract concepts (one LLM call per source, or one per chunk for large sources)
@@ -734,7 +746,7 @@ git commit -m "refactor: remove separate extract phase — concepts now returned
 
 ---
 
-## Task 5: Replace sequential write+relate loop with parallel `writeAndRelate`
+### Task 5: Replace sequential write+relate loop with parallel `writeAndRelate`
 
 **Files:**
 - Modify: `src/commands/compile.ts` (Step 4 of the action handler)
@@ -850,7 +862,7 @@ git commit -m "refactor: replace sequential write+relate loop with parallel writ
 
 ---
 
-## Task 6: Final build, test run, and push
+### Task 6: Final build, test run, and push
 
 - [ ] **Step 1: Final clean build**
 
@@ -866,7 +878,7 @@ Expected: No errors, no warnings.
 npm test
 ```
 
-Expected: All tests pass (23 original + 6 writeAndRelate + 6 summarizeAndExtract + 5 mergeExtractedConcepts = 40 tests total).
+Expected: All tests pass.
 
 - [ ] **Step 3: Verify no dead imports remain**
 
@@ -886,18 +898,377 @@ Expected: Push succeeds.
 
 ---
 
-## Summary of Changes
+## Contradiction-Aware Tasks (7-9)
+
+### Task 7: Post-compile contradiction check
+
+**Files:**
+- Modify: `src/commands/compile.ts` — add post-compile contradiction check
+- Modify: `src/commands/lint.ts` — export contradiction functions for reuse
+
+After Steps 1-7 of compile, add a post-compile step that runs the contradiction detection pipeline. This is nearly free due to incremental checking (`checked_pairs.json`) — only changed articles trigger re-verification.
+
+The contradiction check should:
+- Run after article writing but before saving manifest
+- Only run if `config.compiler.auto_lint !== false` (respect existing config flag)
+- Output results to stderr (not stdout — keep JSON stats clean)
+- Add `contradiction_stats` to the compile output JSON:
+  ```json
+  {
+    "contradiction_candidates_checked": 12,
+    "contradiction_verified": 2,
+    "contradiction_pending_review": 1,
+    "contradiction_skipped": 9,
+    "contradiction_errors": 0
+  }
+  ```
+
+- [ ] **Step 1: Read `src/lib/conflicts.ts` to understand the exported functions**
+
+Note: `generateCandidates`, `extractClaims`, `verifyContradiction`, `loadCheckedPairs`, `saveCheckedPairs`, `shouldRecheck`, `hashContent` are exported.
+
+- [ ] **Step 2: Create a `runContradictionCheck` helper function in `compile.ts`**
+
+Add this near the top of `src/commands/compile.ts` (or in a new `src/lib/contradiction.ts`):
+
+```typescript
+async function runContradictionCheck(
+  dir: string,
+  config: import("../lib/config.js").WikicConfig,
+  manifest: import("../lib/manifest.js").Manifest,
+  relations: import("../lib/manifest.js").RelationEntry[]
+): Promise<{
+  candidatesChecked: number;
+  verified: number;
+  pendingReview: number;
+  skipped: number;
+  errors: number;
+}> {
+  const { generateCandidates, extractClaims, verifyContradiction, loadCheckedPairs, saveCheckedPairs, shouldRecheck, hashContent } = await import("../lib/conflicts.js");
+
+  const articleCache: Record<string, string> = {};
+  for (const [slug, concept] of Object.entries(manifest.concepts)) {
+    try {
+      articleCache[slug] = readText(join(dir, concept.article_path));
+    } catch {
+      articleCache[slug] = "";
+    }
+  }
+
+  const candidates = generateCandidates(manifest, relations, articleCache);
+  const checkedPairs = loadCheckedPairs(dir);
+  const updatedPairs: typeof checkedPairs = [];
+  
+  let candidatesChecked = 0;
+  let verified = 0;
+  let pendingReview = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  for (const candidate of candidates) {
+    const contentA = articleCache[candidate.slugA];
+    const contentB = articleCache[candidate.slugB];
+    if (!contentA || !contentB) continue;
+
+    const currentHashA = hashContent(contentA);
+    const currentHashB = hashContent(contentB);
+
+    const existing = checkedPairs.find(
+      (p) => p.slugA === candidate.slugA && p.slugB === candidate.slugB
+    );
+
+    if (existing && !shouldRecheck(existing, currentHashA, currentHashB)) {
+      skipped++;
+      updatedPairs.push(existing);
+      continue;
+    }
+
+    candidatesChecked++;
+
+    try {
+      const claimsA = await extractClaims(contentA, candidate.slugA, config);
+      const claimsB = await extractClaims(contentB, candidate.slugB, config);
+      const result = await verifyContradiction(
+        candidate.slugA, claimsA,
+        candidate.slugB, claimsB,
+        config
+      );
+
+      if (result.verified) {
+        verified++;
+        // upsertRelation will be called by the caller after this function
+      } else if (result.needsHumanReview) {
+        pendingReview++;
+      }
+
+      updatedPairs.push({
+        slugA: candidate.slugA,
+        slugB: candidate.slugB,
+        articleHashA: currentHashA,
+        articleHashB: currentHashB,
+        lastChecked: new Date().toISOString(),
+        previouslyVerified: result.verified,
+      });
+    } catch {
+      errors++;
+      updatedPairs.push({
+        slugA: candidate.slugA,
+        slugB: candidate.slugB,
+        articleHashA: currentHashA,
+        articleHashB: currentHashB,
+        lastChecked: new Date().toISOString(),
+        previouslyVerified: false,
+      });
+    }
+  }
+
+  saveCheckedPairs(dir, updatedPairs);
+
+  return { candidatesChecked, verified, pendingReview, skipped, errors };
+}
+```
+
+- [ ] **Step 3: Add post-compile step in compile.ts action handler**
+
+Add after Step 7 (update CHANGELOG) and before saveManifest:
+
+```typescript
+// Step 8: Post-compile contradiction check
+let contradictionStats = { candidatesChecked: 0, verified: 0, pendingReview: 0, skipped: 0, errors: 0 };
+if (config.compiler.auto_lint !== false && toProcess.length > 0) {
+  console.error('  Running contradiction check...');
+  try {
+    contradictionStats = await runContradictionCheck(dir, config, manifest, relations);
+    if (contradictionStats.verified > 0 || contradictionStats.pendingReview > 0) {
+      console.error(`  Contradictions: ${contradictionStats.verified} verified, ${contradictionStats.pendingReview} pending review, ${contradictionStats.skipped} skipped (unchanged)`);
+    }
+  } catch (e) {
+    console.error(`  Contradiction check failed: ${e}`);
+    contradictionStats.errors = 1;
+  }
+}
+```
+
+- [ ] **Step 4: Update the compile output JSON to include contradiction stats**
+
+Find the final `console.log(JSON.stringify({ ok: true, ...stats }))` and add `contradiction_stats`:
+
+```typescript
+console.log(JSON.stringify({
+  ok: true,
+  ...stats,
+  contradiction_stats: contradictionStats,
+}));
+```
+
+- [ ] **Step 5: Add `contradiction_stats` to `CompileStats` interface**
+
+```typescript
+interface CompileStats {
+  // ... existing fields ...
+  contradiction_stats?: {
+    candidatesChecked: number;
+    verified: number;
+    pendingReview: number;
+    skipped: number;
+    errors: number;
+  };
+}
+```
+
+- [ ] **Step 6: Build and run tests**
+
+```bash
+npm run build && npm test
+```
+
+Expected: All tests pass.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/commands/compile.ts
+git commit -m "feat: add post-compile contradiction check, runs automatically unless auto_lint is disabled"
+```
+
+---
+
+### Task 8: Create `wikic contradictions` — human review command
+
+**Files:**
+- Create: `src/commands/contradictions.ts`
+- Create: `tests/commands/contradictions.test.ts`
+- Modify: `src/index.ts` — register `contradictionsCommand`
+
+The contradictions command provides a structured human review workflow. It surfaces pending candidates, lets humans confirm/reject, and manages the review queue.
+
+**Commands:**
+
+```bash
+wikic contradictions              # list all contradictions (verified + pending)
+wikic contradictions --pending    # list only pending review
+wikic contradictions --verified  # list only verified
+wikic contradictions --review <slugA> <slugB>  # review a specific pair
+wikic contradictions --confirm <slugA> <slugB>  # confirm: write contradicts edge
+wikic contradictions --dismiss <slugA> <slugB>  # dismiss: remove from candidates
+wikic contradictions --export    # export all contradictions as JSON
+wikic contradictions --export-candidates  # export only pending candidates
+```
+
+**Data structures:**
+
+```typescript
+// .wikic/review_queue.json
+export interface ReviewQueue {
+  pending: ReviewItem[];
+  confirmed: ReviewItem[];
+  dismissed: ReviewItem[];
+}
+
+export interface ReviewItem {
+  slugA: string;
+  slugB: string;
+  addedAt: string;
+  reviewedAt?: string;
+  confidence?: number;
+  conflicts?: ClaimContradiction[];
+  notes?: string;  // human reviewer's notes
+}
+```
+
+**Implementation notes:**
+- Use `loadRelations` to read/write `graph.json` for verified contradictions
+- Use a new `review_queue.json` file in `.wikic/` for the queue
+- `--review` should load both article files and display their content in context of the candidate conflicts
+- `--confirm` should call `upsertRelation` with the `contradicts` type and move the item to `confirmed`
+- `--dismiss` should remove from `pending` and add to `dismissed`
+- Export formats: JSON (machine-readable), Markdown (human-readable)
+
+- [ ] **Step 1: Write the command skeleton**
+
+Create `src/commands/contradictions.ts`:
+
+```typescript
+import { Command } from "commander";
+import { loadConfig } from "../lib/config.js";
+import { loadManifest, loadRelations, saveRelations, upsertRelation, type RelationEntry, type RelationType } from "../lib/manifest.js";
+import { readText } from "../lib/files.js";
+import { join } from "path";
+import { generateCandidates, loadCheckedPairs, extractClaims, verifyContradiction } from "../lib/conflicts.js";
+```
+
+Implement the subcommands as described above.
+
+- [ ] **Step 2: Write integration tests**
+
+Create `tests/commands/contradictions.test.ts` with tests for all subcommands. Use the same temp project setup pattern as `lint.integration.test.ts`.
+
+- [ ] **Step 3: Register in `src/index.ts`**
+
+```typescript
+import { contradictionsCommand } from "./commands/contradictions.js";
+// ... after graphCommand ...
+program.addCommand(contradictionsCommand);
+```
+
+- [ ] **Step 4: Build and test**
+
+```bash
+npm run build && npm test
+```
+
+Expected: All tests pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/commands/contradictions.ts tests/commands/contradictions.test.ts src/index.ts
+git commit -m "feat: add wikic contradictions command for human review workflow"
+```
+
+---
+
+### Task 9: Final integration, test run, and push
+
+- [ ] **Step 1: Clean build**
+
+```bash
+npm run build
+```
+
+Expected: No TypeScript errors.
+
+- [ ] **Step 2: Full test suite**
+
+```bash
+npm test
+```
+
+Expected: All tests pass.
+
+- [ ] **Step 3: End-to-end smoke test**
+
+```bash
+cd /tmp/wikic-model-test
+rm -rf wiki .wikic
+wikic init --project model-test
+wikic add /path/to/some/research.md
+wikic compile --full
+# Should show:
+# - articles_written > 0
+# - relations_extracted > 0
+# - contradiction_candidates_checked > 0
+
+wikic contradictions --pending
+# Should list pending contradictions
+
+wikic contradictions --export
+# Should export JSON
+
+wikic contradictions --review <slugA> <slugB>
+# Should display review interface
+```
+
+- [ ] **Step 4: Verify all old prompt files are still referenced nowhere**
+
+```bash
+grep -rn "from.*prompts/summarize\|from.*prompts/extract\|from.*prompts/write\|from.*prompts/relate\|from.*prompts/merge" src/
+```
+
+Expected: No output (all old prompts are reference-only).
+
+- [ ] **Step 5: Push**
+
+```bash
+git push
+```
+
+---
+
+## Summary of All Changes
+
+### LLM Call Reduction
 
 | File | Action | Why |
 |---|---|---|
 | `src/prompts/writeAndRelate.ts` | Create | Combined write+relate prompt and sentinel parser |
 | `src/prompts/summarizeAndExtract.ts` | Create | Combined summarize+extract prompt and sentinel parser |
-| `src/commands/compile.ts` | Modify | New imports, `mergeExtractedConcepts` export, rewritten `summarizeSource`, collapsed Steps 2+3, parallelised Step 4 |
+| `src/commands/compile.ts` | Modify | New imports, `mergeExtractedConcepts` export, rewritten `summarizeSource`, collapsed Steps 2+3, parallelised Step 4, post-compile contradiction check |
 | `tests/prompts/writeAndRelate.test.ts` | Create | 6 parser unit tests |
 | `tests/prompts/summarizeAndExtract.test.ts` | Create | 6 parser unit tests |
 | `tests/lib/compile.test.ts` | Create | 5 `mergeExtractedConcepts` unit tests |
-| `src/prompts/summarize.ts` | Untouched | Kept as reference, no longer imported |
-| `src/prompts/extract.ts` | Untouched | Kept as reference, no longer imported |
-| `src/prompts/write.ts` | Untouched | Kept as reference, no longer imported |
-| `src/prompts/relate.ts` | Untouched | Kept as reference, no longer imported |
-| `src/prompts/merge.ts` | Untouched | Kept as reference, no longer imported |
+
+### Contradiction-Aware Compilation
+
+| File | Action | Why |
+|---|---|---|
+| `src/commands/contradictions.ts` | Create | Human review workflow: list, review, confirm, dismiss |
+| `tests/commands/contradictions.test.ts` | Create | Integration tests for review workflow |
+| `src/commands/compile.ts` | Modify | Post-compile contradiction check (Step 8) |
+| `src/commands/lint.ts` | Modify | Functions already exported for reuse |
+| `src/index.ts` | Modify | Register contradictionsCommand |
+| `src/prompts/summarize.ts` | Untouched | Kept as reference |
+| `src/prompts/extract.ts` | Untouched | Kept as reference |
+| `src/prompts/write.ts` | Untouched | Kept as reference |
+| `src/prompts/relate.ts` | Untouched | Kept as reference (replaced by writeAndRelate) |
+| `src/prompts/merge.ts` | Untouched | Kept as reference |

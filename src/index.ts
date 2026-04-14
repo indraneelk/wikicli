@@ -11,6 +11,7 @@ import { searchCommand } from "./commands/search.js";
 import { graphCommand } from "./commands/graph.js";
 import { statusCommand } from "./commands/status.js";
 import { removeCommand } from "./commands/remove.js";
+import { contradictionsCommand } from "./commands/contradictions.js";
 
 const program = new Command();
 
@@ -29,5 +30,6 @@ program.addCommand(searchCommand);
 program.addCommand(graphCommand);
 program.addCommand(statusCommand);
 program.addCommand(removeCommand);
+program.addCommand(contradictionsCommand);
 
 program.parse();

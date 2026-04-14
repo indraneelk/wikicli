@@ -6,12 +6,9 @@ import { hashFile } from "../lib/hash.js";
 import { readText, writeText, ensureDir, listMarkdownFiles } from "../lib/files.js";
 import { slugify } from "../lib/slug.js";
 import { llmCall, OPENCODE_FREE_MODELS } from "../lib/llm.js";
-import { SUMMARIZE_SYSTEM, buildSummarizePrompt } from "../prompts/summarize.js";
-import { EXTRACT_SYSTEM, buildExtractPrompt } from "../prompts/extract.js";
-import { WRITE_SYSTEM, buildWritePrompt } from "../prompts/write.js";
-import { RELATE_SYSTEM, buildRelatePrompt } from "../prompts/relate.js";
 import { chunkContent } from "../lib/chunker.js";
-import { MERGE_SYSTEM, buildMergePrompt } from "../prompts/merge.js";
+import { SUMMARIZE_AND_EXTRACT_SYSTEM, buildSummarizeAndExtractPrompt, parseSummarizeAndExtractResponse } from "../prompts/summarizeAndExtract.js";
+import { WRITE_AND_RELATE_SYSTEM, buildWriteAndRelatePrompt, parseWriteAndRelateResponse } from "../prompts/writeAndRelate.js";
 
 interface ExtractedConcept {
   name: string;
@@ -27,6 +24,13 @@ interface CompileStats {
   articles_written: number;
   relations_extracted: number;
   errors: string[];
+  contradiction_stats?: {
+    candidatesChecked: number;
+    verified: number;
+    pendingReview: number;
+    skipped: number;
+    errors: number;
+  };
 }
 
 async function runParallel<T, R>(
@@ -38,7 +42,6 @@ async function runParallel<T, R>(
   let next = 0;
 
   async function worker(): Promise<void> {
-    // Safe: JS is single-threaded; `next++` is atomic across awaits.
     while (next < items.length) {
       const i = next++;
       results[i] = await fn(items[i], i);
@@ -53,25 +56,46 @@ async function runParallel<T, R>(
   return results;
 }
 
+export function mergeExtractedConcepts(
+  concepts: Array<{ name: string; aliases: string[]; confidence: string }>
+): Array<{ name: string; aliases: string[]; confidence: string }> {
+  const merged = new Map<string, { name: string; aliases: string[]; confidence: string }>();
+  for (const c of concepts) {
+    const key = c.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    const existing = merged.get(key);
+    if (existing) {
+      existing.aliases = [...new Set([...existing.aliases, ...c.aliases])];
+      if (c.confidence === 'high') existing.confidence = 'high';
+    } else {
+      merged.set(key, { ...c, aliases: [...c.aliases] });
+    }
+  }
+  return [...merged.values()];
+}
+
 async function summarizeSource(
   sourcePath: string,
   content: string,
   config: import("../lib/config.js").WikicConfig,
   dir: string
-): Promise<{ ok: true; summaryPath: string } | { ok: false; error?: string }> {
+): Promise<
+  | { ok: true; summaryPath: string; concepts: Array<{ name: string; aliases: string[]; confidence: string }> }
+  | { ok: false; error?: string }
+> {
   const summaryFileName =
     sourcePath.replace(/^.*\//, "").replace(/\.md$/, "") + ".md";
   const summaryPath = join(config.output_dir, "summaries", summaryFileName);
 
   if (content.length <= config.compiler.chunk_threshold) {
     const resp = await llmCall(
-      SUMMARIZE_SYSTEM,
-      buildSummarizePrompt(sourcePath, content),
+      SUMMARIZE_AND_EXTRACT_SYSTEM,
+      buildSummarizeAndExtractPrompt(sourcePath, content),
       config
     );
     if (!resp.ok) return { ok: false, error: resp.error };
-    writeText(join(dir, summaryPath), resp.text);
-    return { ok: true, summaryPath };
+    const { summary, concepts } = parseSummarizeAndExtractResponse(resp.text);
+    writeText(join(dir, summaryPath), summary);
+    return { ok: true, summaryPath, concepts };
   }
 
   const chunks = chunkContent(
@@ -79,15 +103,15 @@ async function summarizeSource(
     config.compiler.chunk_size,
     config.compiler.min_chunk_size
   );
-  console.error(`  ${sourcePath}: ${chunks.length} chunks, summarizing in parallel...`);
+  console.error(`  ${sourcePath}: ${chunks.length} chunks, summarising in parallel...`);
 
   const chunkResults = await runParallel(
     chunks,
     config.compiler.max_parallel,
     (chunk, i) =>
       llmCall(
-        SUMMARIZE_SYSTEM,
-        buildSummarizePrompt(
+        SUMMARIZE_AND_EXTRACT_SYSTEM,
+        buildSummarizeAndExtractPrompt(
           `Chunk ${i + 1} of ${chunks.length} from: ${sourcePath}`,
           chunk
         ),
@@ -98,15 +122,107 @@ async function summarizeSource(
   const failed = chunkResults.find((r) => !r.ok);
   if (failed) return { ok: false, error: failed.error };
 
-  const mergeResp = await llmCall(
-    MERGE_SYSTEM,
-    buildMergePrompt(chunkResults.map((r) => r.text), sourcePath),
-    config
-  );
-  if (!mergeResp.ok) return { ok: false, error: mergeResp.error };
+  const parsed = chunkResults.map((r) => parseSummarizeAndExtractResponse(r.text));
+  const concepts = mergeExtractedConcepts(parsed.flatMap((p) => p.concepts));
 
-  writeText(join(dir, summaryPath), mergeResp.text);
-  return { ok: true, summaryPath };
+  const combinedSummary = parsed.map((p) => p.summary).join('\n\n---\n\n');
+  writeText(join(dir, summaryPath), combinedSummary);
+
+  return { ok: true, summaryPath, concepts };
+}
+
+async function runContradictionCheck(
+  dir: string,
+  config: import("../lib/config.js").WikicConfig,
+  manifest: import("../lib/manifest.js").Manifest,
+  relationsArr: import("../lib/manifest.js").RelationEntry[]
+): Promise<{
+  candidatesChecked: number;
+  verified: number;
+  pendingReview: number;
+  skipped: number;
+  errors: number;
+}> {
+  const { generateCandidates, extractClaims, verifyContradiction, loadCheckedPairs, saveCheckedPairs, shouldRecheck, hashContent } = await import("../lib/conflicts.js");
+
+  const articleCache: Record<string, string> = {};
+  for (const [slug, concept] of Object.entries(manifest.concepts)) {
+    try {
+      articleCache[slug] = readText(join(dir, concept.article_path));
+    } catch {
+      articleCache[slug] = "";
+    }
+  }
+
+  const candidates = generateCandidates(manifest, relationsArr, articleCache);
+  const checkedPairs = loadCheckedPairs(dir);
+  const updatedPairs: typeof checkedPairs = [];
+
+  let candidatesChecked = 0;
+  let verified = 0;
+  let pendingReview = 0;
+  let skipped = 0;
+  let errors = 0;
+
+  for (const candidate of candidates) {
+    const contentA = articleCache[candidate.slugA];
+    const contentB = articleCache[candidate.slugB];
+    if (!contentA || !contentB) continue;
+
+    const currentHashA = hashContent(contentA);
+    const currentHashB = hashContent(contentB);
+
+    const existing = checkedPairs.find(
+      (p) => p.slugA === candidate.slugA && p.slugB === candidate.slugB
+    );
+
+    if (existing && !shouldRecheck(existing, currentHashA, currentHashB)) {
+      skipped++;
+      updatedPairs.push(existing);
+      continue;
+    }
+
+    candidatesChecked++;
+
+    try {
+      const claimsA = await extractClaims(contentA, candidate.slugA, config);
+      const claimsB = await extractClaims(contentB, candidate.slugB, config);
+      const result = await verifyContradiction(
+        candidate.slugA, claimsA,
+        candidate.slugB, claimsB,
+        config
+      );
+
+      if (result.verified) {
+        verified++;
+      } else if (result.needsHumanReview) {
+        pendingReview++;
+      }
+
+      updatedPairs.push({
+        slugA: candidate.slugA,
+        slugB: candidate.slugB,
+        articleHashA: currentHashA,
+        articleHashB: currentHashB,
+        lastChecked: new Date().toISOString(),
+        previouslyVerified: result.verified,
+      });
+    } catch {
+      errors++;
+      updatedPairs.push({
+        slugA: candidate.slugA,
+        slugB: candidate.slugB,
+        articleHashA: currentHashA,
+        articleHashB: currentHashB,
+        lastChecked: new Date().toISOString(),
+        previouslyVerified: false,
+      });
+    }
+  }
+
+  saveCheckedPairs(dir, updatedPairs);
+
+  return { candidatesChecked, verified, pendingReview, skipped, errors };
 }
 
 export const compileCommand = new Command("compile")
@@ -160,9 +276,10 @@ export const compileCommand = new Command("compile")
 
     console.error(`Compiling ${toProcess.length} source(s)...`);
 
-    // Step 2: Summarize (with chunking for large files)
+    // Step 2: Summarise + extract concepts
     const summariesDir = join(dir, config.output_dir, "summaries");
     ensureDir(summariesDir);
+    const allConcepts: Map<string, { concept: ExtractedConcept; sources: string[] }> = new Map();
 
     for (const sourcePath of toProcess) {
       const content = readText(join(dir, sourcePath));
@@ -179,49 +296,22 @@ export const compileCommand = new Command("compile")
       manifest.sources[sourcePath].summary_path = result.summaryPath ?? null;
       manifest.sources[sourcePath].compiled_at = new Date().toISOString();
       stats.summarized++;
-    }
 
-    // Step 3: Extract concepts from summaries
-    const allConcepts: Map<string, { concept: ExtractedConcept; sources: string[] }> = new Map();
-
-    for (const sourcePath of toProcess) {
-      const entry = manifest.sources[sourcePath];
-      if (!entry.summary_path || entry.status === "error") continue;
-
-      const summaryContent = readText(join(dir, entry.summary_path));
-      console.error(`  Extracting concepts from ${sourcePath}...`);
-      const resp = await llmCall(EXTRACT_SYSTEM, buildExtractPrompt(summaryContent), config);
-
-      if (!resp.ok) {
-        stats.errors.push(`Extract failed for ${sourcePath}: ${resp.error}`);
-        continue;
-      }
-
-      try {
-        // Try to parse JSON from the response (handle markdown fences)
-        let jsonStr = resp.text.trim();
-        if (jsonStr.startsWith("```")) {
-          jsonStr = jsonStr.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
-        }
-        const concepts: ExtractedConcept[] = JSON.parse(jsonStr);
-
-        for (const c of concepts) {
-          const slug = slugify(c.name);
-          const existing = allConcepts.get(slug);
-          if (existing) {
-            existing.sources.push(sourcePath);
-            existing.concept.aliases = [...new Set([...existing.concept.aliases, ...c.aliases])];
-          } else {
-            allConcepts.set(slug, { concept: c, sources: [sourcePath] });
-          }
+      for (const c of result.concepts) {
+        const slug = slugify(c.name);
+        const existing = allConcepts.get(slug);
+        if (existing) {
+          existing.sources.push(sourcePath);
+          existing.concept.aliases = [...new Set([...existing.concept.aliases, ...c.aliases])];
+          if (c.confidence === 'high') existing.concept.confidence = 'high';
+        } else {
+          allConcepts.set(slug, { concept: c, sources: [sourcePath] });
           stats.concepts_extracted++;
         }
-      } catch {
-        stats.errors.push(`Failed to parse concepts from ${sourcePath}: ${resp.text.slice(0, 200)}`);
       }
     }
 
-    // Step 4: Write concept articles
+    // Step 3: Write concept articles + extract relations (combined, in parallel)
     const conceptsDir = join(dir, config.output_dir, "concepts");
     ensureDir(conceptsDir);
     const allSlugs = [
@@ -229,85 +319,89 @@ export const compileCommand = new Command("compile")
       ...Object.keys(manifest.concepts),
     ];
 
-    for (const [slug, { concept, sources }] of allConcepts) {
-      console.error(`  Writing article: ${slug}...`);
+    await runParallel(
+      [...allConcepts.entries()],
+      config.compiler.max_parallel,
+      async ([slug, { concept, sources }]) => {
+        console.error(`  Writing article: ${slug}...`);
 
-      // Gather source material for this concept
-      const sourceMaterial: string[] = [];
-      for (const sp of sources) {
-        const entry = manifest.sources[sp];
-        if (entry?.summary_path) {
-          sourceMaterial.push(readText(join(dir, entry.summary_path)));
-        }
-      }
-
-      const articlePath = join(config.output_dir, "concepts", `${slug}.md`);
-
-      const resp = await llmCall(
-        WRITE_SYSTEM,
-        buildWritePrompt(
-          concept.name,
-          slug,
-          concept.aliases,
-          sources,
-          concept.confidence,
-          sourceMaterial.join("\n\n---\n\n"),
-          allSlugs
-        ),
-        config
-      );
-
-      if (!resp.ok) {
-        stats.errors.push(`Write failed for ${slug}: ${resp.error}`);
-        continue;
-      }
-
-      writeText(join(dir, articlePath), resp.text);
-
-      const relateResp = await llmCall(
-        RELATE_SYSTEM,
-        buildRelatePrompt(concept.name, slug, sourceMaterial.join("\n\n"), allSlugs),
-        config
-      );
-
-      if (relateResp.ok) {
-        try {
-          let jsonStr = relateResp.text.trim();
-          if (jsonStr.startsWith("```")) {
-            jsonStr = jsonStr.replace(/^```(?:json)?\n?/, "").replace(/\n?```$/, "");
+        const sourceMaterial: string[] = [];
+        for (const sp of sources) {
+          const entry = manifest.sources[sp];
+          if (entry?.summary_path) {
+            sourceMaterial.push(readText(join(dir, entry.summary_path)));
           }
-          const parsed = JSON.parse(jsonStr) as Array<{ target: string; type: string; evidence?: string }>;
-          for (const rel of parsed) {
-            upsertRelation(manifest, relations, slug, rel.target, rel.type as import("../lib/manifest.js").RelationType, rel.evidence ?? "");
-            stats.relations_extracted++;
-          }
-        } catch {
-          stats.errors.push(`Failed to parse relations for ${slug}: ${relateResp.text.slice(0, 200)}`);
         }
-      } else {
-        stats.errors.push(`Relation extraction failed for ${slug}: ${relateResp.error}`);
+
+        const articlePath = join(config.output_dir, "concepts", `${slug}.md`);
+
+        const resp = await llmCall(
+          WRITE_AND_RELATE_SYSTEM,
+          buildWriteAndRelatePrompt(
+            concept.name,
+            slug,
+            concept.aliases,
+            sources,
+            concept.confidence,
+            sourceMaterial.join("\n\n---\n\n"),
+            allSlugs
+          ),
+          config
+        );
+
+        if (!resp.ok) {
+          stats.errors.push(`Write failed for ${slug}: ${resp.error}`);
+          return;
+        }
+
+        const { article, relations: parsedRelations } = parseWriteAndRelateResponse(resp.text);
+        writeText(join(dir, articlePath), article);
+
+        for (const rel of parsedRelations) {
+          upsertRelation(
+            manifest,
+            relations,
+            slug,
+            rel.target,
+            rel.type as import("../lib/manifest.js").RelationType,
+            rel.evidence ?? ""
+          );
+          stats.relations_extracted++;
+        }
+
+        upsertConcept(manifest, slug, sources[0], articlePath, concept.aliases);
+        manifest.concepts[slug].last_compiled = new Date().toISOString();
+        for (const sp of sources) {
+          upsertConcept(manifest, slug, sp, articlePath);
+        }
+        manifest.sources[sources[0]].status = "compiled";
+        stats.articles_written++;
       }
+    );
 
-      upsertConcept(manifest, slug, sources[0], articlePath, concept.aliases);
-      manifest.concepts[slug].last_compiled = new Date().toISOString();
-
-      // Register all sources for this concept
-      for (const sp of sources) {
-        upsertConcept(manifest, slug, sp, articlePath);
-      }
-
-      manifest.sources[sources[0]].status = "compiled";
-      stats.articles_written++;
-    }
-
-    // Step 5: Generate index
+    // Step 4: Generate index
     generateIndex(dir, config.output_dir, manifest);
 
-    // Step 6: Generate MOC (Map of Content)
+    // Step 5: Generate MOC (Map of Content)
     generateMOC(dir, config.output_dir, manifest);
 
-    // Step 7: Update CHANGELOG
+    // Step 6: Update CHANGELOG
     appendChangelog(dir, config.output_dir, stats);
+
+    // Step 7: Post-compile contradiction check
+    if (config.compiler.auto_lint !== false && toProcess.length > 0) {
+      console.error('  Running contradiction check...');
+      try {
+        const cStats = await runContradictionCheck(dir, config, manifest, relations);
+        if (cStats.verified > 0 || cStats.pendingReview > 0) {
+          console.error(`  Contradictions: ${cStats.verified} verified, ${cStats.pendingReview} pending review, ${cStats.skipped} skipped (unchanged)`);
+        }
+        stats.contradiction_stats = cStats;
+      } catch (e) {
+        console.error(`  Contradiction check failed: ${e}`);
+        stats.contradiction_stats = { candidatesChecked: 0, verified: 0, pendingReview: 0, skipped: 0, errors: 1 };
+      }
+    }
 
     // Mark all processed sources as compiled
     for (const sp of toProcess) {
@@ -351,7 +445,6 @@ function generateIndex(dir: string, outputDir: string, manifest: import("../lib/
 }
 
 function generateMOC(dir: string, outputDir: string, manifest: import("../lib/manifest.js").Manifest): void {
-  // Read concept articles to extract tags
   const tagMap: Record<string, string[]> = {};
 
   for (const [slug, concept] of Object.entries(manifest.concepts)) {
@@ -388,14 +481,15 @@ function generateMOC(dir: string, outputDir: string, manifest: import("../lib/ma
 }
 
 function appendChangelog(dir: string, outputDir: string, stats: CompileStats): void {
-  const changelogPath = join(dir, outputDir, "CHANGELOG.md");
+  const changelogPath = join(outputDir, "CHANGELOG.md");
   let existing = "";
   try {
-    existing = readText(changelogPath);
+    existing = readText(join(dir, changelogPath));
   } catch {
     existing = "# CHANGELOG\n\nCompilation history.\n";
   }
 
+  const cStats = stats.contradiction_stats;
   const entry = `
 ## ${new Date().toISOString()}
 
@@ -405,9 +499,13 @@ function appendChangelog(dir: string, outputDir: string, stats: CompileStats): v
 - Concepts extracted: ${stats.concepts_extracted}
 - Articles written: ${stats.articles_written}
 - Relations extracted: ${stats.relations_extracted}
+${cStats ? `- Contradiction candidates checked: ${cStats.candidatesChecked}
+- Contradictions verified: ${cStats.verified}
+- Contradictions pending review: ${cStats.pendingReview}
+- Contradictions skipped (unchanged): ${cStats.skipped}` : ''}
 - Errors: ${stats.errors.length}
 ${stats.errors.length > 0 ? stats.errors.map((e) => `  - ${e}`).join("\n") : ""}
 `;
 
-  writeText(changelogPath, existing + entry);
+  writeText(join(dir, changelogPath), existing + entry);
 }
