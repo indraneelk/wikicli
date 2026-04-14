@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { generateCandidates, extractFacts } from '../../src/lib/conflicts.ts';
+import { generateCandidates, simpleExtractFacts } from '../../src/lib/conflicts.ts';
 import type { Manifest } from '../../src/lib/manifest.ts';
 import type { RelationEntry } from '../../src/lib/manifest.ts';
 
@@ -20,7 +20,7 @@ describe('conflicts integration - pure functions', () => {
       };
       const relations: RelationEntry[] = [];
 
-      const candidates = generateCandidates(manifest, relations);
+      const candidates = generateCandidates(manifest, relations, {});
 
       assert.ok(candidates.length > 0, 'Should have at least one candidate');
       const pair = candidates.find(c => 
@@ -45,7 +45,7 @@ describe('conflicts integration - pure functions', () => {
       };
       const relations: RelationEntry[] = [];
 
-      const candidates = generateCandidates(manifest, relations);
+      const candidates = generateCandidates(manifest, relations, {});
 
       assert.equal(candidates.length, 1);
       const pair = candidates[0];
@@ -70,16 +70,16 @@ describe('conflicts integration - pure functions', () => {
         { id: '1', source: 'concept-a', target: 'concept-b', type: 'extends', created_at: '2024-01-01T00:00:00Z' },
       ];
 
-      const candidates = generateCandidates(manifest, relations);
+      const candidates = generateCandidates(manifest, relations, {});
 
       assert.equal(candidates.length, 1);
     });
   });
 
-  describe('extractFacts', () => {
+  describe('simpleExtractFacts', () => {
     it('extracts numeric performance claims', () => {
       const content = 'This algorithm achieves 99.5% accuracy on the test set and runs 10x faster than baseline.';
-      const facts = extractFacts(content);
+      const facts = simpleExtractFacts(content);
       const numbers = facts.filter(f => f.type === 'number');
 
       assert.ok(numbers.length > 0, 'Should extract numeric facts');
@@ -89,7 +89,7 @@ describe('conflicts integration - pure functions', () => {
 
     it('extracts date patterns', () => {
       const content = 'The company was founded in 2020 and went public on January 15, 2024.';
-      const facts = extractFacts(content);
+      const facts = simpleExtractFacts(content);
       const dates = facts.filter(f => f.type === 'date');
 
       assert.ok(dates.length > 0, 'Should extract date facts');
@@ -98,7 +98,7 @@ describe('conflicts integration - pure functions', () => {
 
     it('extracts definition patterns', () => {
       const content = 'Transformer is a type of deep learning architecture that is defined as self-attention based.';
-      const facts = extractFacts(content);
+      const facts = simpleExtractFacts(content);
       const defs = facts.filter(f => f.type === 'definition');
 
       assert.ok(defs.length > 0, 'Should extract definition facts');
@@ -107,7 +107,7 @@ describe('conflicts integration - pure functions', () => {
 
     it('extracts claim patterns with absolute quantifiers', () => {
       const content = 'All users always prefer this option. None of the alternatives perform better.';
-      const facts = extractFacts(content);
+      const facts = simpleExtractFacts(content);
       const claims = facts.filter(f => f.type === 'claim');
 
       assert.ok(claims.length > 0, 'Should extract claim facts');

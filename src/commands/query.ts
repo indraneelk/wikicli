@@ -86,6 +86,7 @@ export const queryCommand = new Command("query")
         contradictions.length > 0
           ? contradictions.map((c) => ({
               between: [c.source, c.target],
+              confidence: (c as any).confidence,
               summary:
                 c.evidence ||
                 `Articles [[${c.source}]] and [[${c.target}]] have contradictory claims`,

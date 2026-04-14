@@ -1,10 +1,34 @@
 import type { Manifest, RelationEntry } from "./manifest.js";
 import type { WikicConfig } from "./config.js";
 import { llmCall } from "./llm.js";
-import { readText } from "./files.js";
+import { readText, writeText, ensureDir } from "./files.js";
+import { existsSync } from "fs";
 import { join } from "path";
 
+const STOPWORDS = new Set([
+  "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+  "have", "has", "had", "do", "does", "did", "will", "would", "could",
+  "should", "may", "might", "must", "shall", "can", "need", "dare", "ought",
+  "used", "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
+  "into", "through", "during", "before", "after", "above", "below", "between",
+  "under", "again", "further", "then", "once", "here", "there", "when", "where",
+  "why", "how", "all", "each", "few", "more", "most", "other", "some", "such",
+  "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very"
+]);
+
 // ── Types ──────────────────────────────────────────────────────────────────────
+
+export interface Claim {
+  id: string;
+  subject: string;
+  predicate: string;
+  object: string;
+  certainty: "definite" | "probable" | "speculative";
+  scope: "universal" | "general" | "specific";
+  negated: boolean;
+  raw: string;
+  excerpt: string;
+}
 
 export interface Fact {
   type: "date" | "number" | "definition" | "performance" | "claim";
@@ -13,34 +37,54 @@ export interface Fact {
   context: string;
 }
 
-export interface ContradictionCandidate {
-  slugA: string;
-  slugB: string;
-  sharedSources: string[];
-}
-
-export interface ContradictionConflict {
-  factA: string;
-  factB: string;
+export interface ClaimContradiction {
+  claimA: Claim;
+  claimB: Claim;
   explanation: string;
+  conflictType: "negation" | "scope_mismatch" | "factual_disagreement" | "definitional" | "other";
   severity: "high" | "medium" | "low";
 }
 
 export interface ContradictionResult {
-  contradicts: boolean;
-  conflicts: ContradictionConflict[];
-  recommendedAction: "merge" | "stale" | "warn";
+  verified: boolean;
+  confidence: number;
+  claimsA: Claim[];
+  claimsB: Claim[];
+  contradictions: ClaimContradiction[];
+  explanation: string;
+  recommendedAction: "review" | "merge" | "stale" | "warn" | "ignore";
+  needsHumanReview: boolean;
 }
 
-// ── Candidate Generation ───────────────────────────────────────────────────────
+export interface ContradictionCandidate {
+  slugA: string;
+  slugB: string;
+  sharedSources: string[];
+  keywordOverlap?: number;
+  hasWikilink?: boolean;
+}
+
+export interface CheckedPair {
+  slugA: string;
+  slugB: string;
+  articleHashA: string;
+  articleHashB: string;
+  lastChecked: string;
+  previouslyVerified: boolean;
+}
+
+// ── Pure Functions ───────────────────────────────────────────────────────────
 
 export function generateCandidates(
   manifest: Manifest,
-  relations: RelationEntry[]
+  relations: RelationEntry[],
+  articleCache: Record<string, string>,
+  options?: { minSharedSources?: number; minKeywordOverlap?: number }
 ): ContradictionCandidate[] {
   const candidates = new Map<string, ContradictionCandidate>();
+  const minSharedSources = options?.minSharedSources ?? 1;
+  const minKeywordOverlap = options?.minKeywordOverlap ?? 0.15;
 
-  // Build source-to-concepts index
   const sourceToConcepts: Record<string, string[]> = {};
   for (const [slug, concept] of Object.entries(manifest.concepts)) {
     for (const src of concept.sources) {
@@ -49,7 +93,6 @@ export function generateCandidates(
     }
   }
 
-  // Generate candidates from shared sources
   for (const [source, slugs] of Object.entries(sourceToConcepts)) {
     for (let i = 0; i < slugs.length; i++) {
       for (let j = i + 1; j < slugs.length; j++) {
@@ -65,20 +108,40 @@ export function generateCandidates(
     }
   }
 
-  // Add pairs from relation graph
   for (const rel of relations) {
     const key = [rel.source, rel.target].sort().join("|");
     if (!candidates.has(key)) {
-      candidates.set(key, { slugA: rel.source, slugB: rel.target, sharedSources: [] });
+      candidates.set(key, { slugA: rel.source, slugB: rel.target, sharedSources: [], hasWikilink: true });
+    } else {
+      candidates.get(key)!.hasWikilink = true;
     }
   }
 
-  return Array.from(candidates.values());
+  for (const [slugA, contentA] of Object.entries(articleCache)) {
+    for (const [slugB, contentB] of Object.entries(articleCache)) {
+      if (slugA >= slugB) continue;
+      const key = `${slugA}|${slugB}`;
+      let candidate = candidates.get(key);
+      const overlap = computeKeywordOverlap(contentA, contentB);
+      if (overlap >= minKeywordOverlap) {
+        if (!candidate) {
+          candidate = { slugA, slugB, sharedSources: [], keywordOverlap: overlap };
+          candidates.set(key, candidate);
+        } else {
+          candidate.keywordOverlap = overlap;
+        }
+      }
+    }
+  }
+
+  return Array.from(candidates.values()).filter(c => 
+    c.sharedSources.length >= minSharedSources || 
+    (c.keywordOverlap ?? 0) >= minKeywordOverlap ||
+    c.hasWikilink
+  );
 }
 
-// ── Claim Extraction ────────────────────────────────────────────────────────────
-
-export function extractFacts(content: string): Fact[] {
+export function simpleExtractFacts(content: string): Fact[] {
   const facts: Fact[] = [];
   const datePatterns = [
     /\b(19|20)\d{2}\b/g,
@@ -171,71 +234,227 @@ export function normalizeFact(fact: Fact): string {
     .trim();
 }
 
-// ── LLM Verification ──────────────────────────────────────────────────────────
+export function computeKeywordOverlap(contentA: string, contentB: string): number {
+  const extractKeywords = (text: string): Set<string> => {
+    const normalized = text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter(word => word.length > 2 && !STOPWORDS.has(word));
+    const freq: Record<string, number> = {};
+    for (const word of normalized) {
+      freq[word] = (freq[word] ?? 0) + 1;
+    }
+    const sorted = Object.entries(freq)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 20)
+      .map(([word]) => word);
+    return new Set(sorted);
+  };
+
+  const keywordsA = extractKeywords(contentA);
+  const keywordsB = extractKeywords(contentB);
+
+  if (keywordsA.size === 0 || keywordsB.size === 0) return 0;
+
+  let intersection = 0;
+  for (const kw of keywordsA) {
+    if (keywordsB.has(kw)) intersection++;
+  }
+
+  const union = keywordsA.size + keywordsB.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+export function hashContent(content: string): string {
+  let hash = 0;
+  for (let i = 0; i < content.length; i++) {
+    const char = content.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return (hash >>> 0).toString(16);
+}
+
+export function loadCheckedPairs(dir: string): CheckedPair[] {
+  const filePath = join(dir, "checked_pairs.json");
+  try {
+    if (existsSync(filePath)) {
+      const content = readText(filePath);
+      return JSON.parse(content) as CheckedPair[];
+    }
+  } catch {
+    return [];
+  }
+  return [];
+}
+
+export function saveCheckedPairs(dir: string, pairs: CheckedPair[]): void {
+  const filePath = join(dir, "checked_pairs.json");
+  try {
+    ensureDir(dir);
+    writeText(filePath, JSON.stringify(pairs, null, 2));
+  } catch (e) {
+    console.error("Failed to save checked pairs:", e);
+  }
+}
+
+export function shouldRecheck(
+  pair: CheckedPair,
+  currentHashA: string,
+  currentHashB: string
+): boolean {
+  return pair.articleHashA !== currentHashA || pair.articleHashB !== currentHashB;
+}
+
+// ── LLM-based Functions ───────────────────────────────────────────────────────
+
+export async function extractClaims(
+  content: string,
+  slug: string,
+  config: WikicConfig
+): Promise<Claim[]> {
+  const systemPrompt = `You are a knowledge claim extractor. Given a wiki article, extract all significant factual claims it makes.
+
+Output ONLY JSON array:
+[
+  {"id": "c1", "subject": "...", "predicate": "...", "object": "...", "certainty": "definite|probable|speculative", "scope": "universal|general|specific", "negated": false, "raw": "...", "excerpt": "..."},
+  ...
+]
+
+Rules:
+- subject: the entity making or receiving the claim (e.g., "transformer", "BERT", "this approach")
+- predicate: the verb or relation (e.g., "achieves", "is a type of", "cannot scale to")
+- object: what is claimed (e.g., "95% accuracy", "a neural architecture", "models with 1B+ parameters")
+- certainty: definite (explicitly stated), probable (likely/probably qualifiers), speculative (may/might/suggests)
+- scope: universal (all/always/none), general (typically/usually), specific (some/rarely/occasionally)
+- negated: true if the claim contains negation words (not, never, cannot, no, without, doesn't, isn't)
+- raw: the exact sentence or phrase containing the claim
+- excerpt: 1-2 sentences of context around the claim
+- Extract 3-15 claims from the article. Focus on claims that could potentially conflict with claims in other articles.
+- Ignore purely definitional claims that are widely accepted facts.
+- Include performance claims, comparative claims, and scope claims.`;
+
+  const truncated = content.slice(0, 4000);
+  const userMessage = `Extract claims from this wiki article:\n\n${truncated}`;
+
+  const response = await llmCall(systemPrompt, userMessage, config);
+
+  if (!response.ok || !response.text) {
+    return [];
+  }
+
+  try {
+    const cleaned = response.text.replace(/^```json\s*|```\s*$/g, "").trim();
+    const parsed = JSON.parse(cleaned);
+    if (Array.isArray(parsed)) {
+      return parsed as Claim[];
+    }
+  } catch {
+    return [];
+  }
+  return [];
+}
 
 export async function verifyContradiction(
   slugA: string,
-  contentA: string,
-  sourcesA: string[],
-  factsA: Fact[],
+  claimsA: Claim[],
   slugB: string,
-  contentB: string,
-  sourcesB: string[],
-  factsB: Fact[],
+  claimsB: Claim[],
   config: WikicConfig
 ): Promise<ContradictionResult> {
-  const systemPrompt = `You are a knowledge consistency checker. Analyze whether two wiki articles contain contradictory claims and output only valid JSON.`;
+  const systemPrompt = `You are a knowledge conflict analyst. Two wiki articles have claims. Determine if they contain contradictory claims.
 
-  const factsALines = factsA.map((f) => `- [${f.type}] ${f.raw}`).join("\n");
-  const factsBLines = factsB.map((f) => `- [${f.type}] ${f.raw}`).join("\n");
+Analyze each claim pair and identify conflicts.
 
-  const userMessage = `Two wiki articles may contain contradictory claims.
+Output ONLY JSON:
+{
+  "verified": true/false,
+  "confidence": 0.0-1.0,
+  "contradictions": [
+    {
+      "claimA_id": "c1",
+      "claimB_id": "c3",
+      "explanation": "Article A claims X while Article B claims not-X",
+      "conflictType": "negation|scope_mismatch|factual_disagreement|definitional|other",
+      "severity": "high|medium|low"
+    }
+  ],
+  "explanation": "Summary of the conflict analysis...",
+  "recommendedAction": "review|merge|stale|warn|ignore",
+  "needsHumanReview": true/false
+}
 
-Article A — [[${slugA}]] (sources: ${sourcesA.join(", ") || "none"}):
-${contentA.slice(0, 3000)}
+Rules:
+- verified: true only if you found specific contradictory claim pairs
+- confidence: how certain are you? Higher for clear negation mismatches, lower for subtle scope disagreements
+- needsHumanReview: true if confidence < 0.8 OR if conflicts are definitional (require domain knowledge)
+- severity: high (clear factual disagreement), medium (scope or certainty mismatch), low (minor disagreement)
+- recommendedAction: review (flag for human), merge (conflicting views exist), stale (one is outdated), warn (minor), ignore (no real conflict)`;
 
-Extracted facts from Article A:
-${factsALines || "(no extractable facts)"}
+  const claimsAJson = JSON.stringify(claimsA, null, 2);
+  const claimsBJson = JSON.stringify(claimsB, null, 2);
 
----
+  const userMessage = `Article A — [[${slugA}]] claims:
+${claimsAJson}
 
-Article B — [[${slugB}]] (sources: ${sourcesB.join(", ") || "none"}):
-${contentB.slice(0, 3000)}
-
-Extracted facts from Article B:
-${factsBLines || "(no extractable facts)"}
-
-Analyze whether the articles contain contradictory claims.
-
-If YES — output ONLY this JSON (no markdown, no explanation):
-{"contradicts":true,"conflicts":[{"factA":"...","factB":"...","explanation":"...","severity":"high|medium|low"}],"recommendedAction":"merge|stale|warn"}
-
-If NO contradiction — output ONLY this JSON:
-{"contradicts":false,"conflicts":[],"recommendedAction":"warn"}`;
+Article B — [[${slugB}]] claims:
+${claimsBJson}`;
 
   const response = await llmCall(systemPrompt, userMessage, config);
 
   if (!response.ok || !response.text) {
     return {
-      contradicts: false,
-      conflicts: [],
-      recommendedAction: "warn",
+      verified: false,
+      confidence: 0,
+      claimsA: [],
+      claimsB: [],
+      contradictions: [],
+      explanation: "LLM call failed",
+      recommendedAction: "ignore",
+      needsHumanReview: true,
     };
   }
 
   try {
     const cleaned = response.text.replace(/^```json\s*|```\s*$/g, "").trim();
-    const parsed = JSON.parse(cleaned) as ContradictionResult;
+    const parsed = JSON.parse(cleaned);
+    
+    const contradictions: ClaimContradiction[] = [];
+    for (const c of parsed.contradictions ?? []) {
+      const claimA = claimsA.find(ca => ca.id === c.claimA_id);
+      const claimB = claimsB.find(cb => cb.id === c.claimB_id);
+      if (claimA && claimB) {
+        contradictions.push({
+          claimA,
+          claimB,
+          explanation: c.explanation,
+          conflictType: c.conflictType,
+          severity: c.severity,
+        });
+      }
+    }
+
     return {
-      contradicts: parsed.contradicts ?? false,
-      conflicts: Array.isArray(parsed.conflicts) ? parsed.conflicts : [],
-      recommendedAction: parsed.recommendedAction ?? "warn",
+      verified: parsed.verified ?? false,
+      confidence: parsed.confidence ?? 0,
+      claimsA,
+      claimsB,
+      contradictions,
+      explanation: parsed.explanation ?? "",
+      recommendedAction: parsed.recommendedAction ?? "ignore",
+      needsHumanReview: parsed.needsHumanReview ?? parsed.confidence < 0.8,
     };
   } catch {
     return {
-      contradicts: false,
-      conflicts: [],
-      recommendedAction: "warn",
+      verified: false,
+      confidence: 0,
+      claimsA: [],
+      claimsB: [],
+      contradictions: [],
+      explanation: "Failed to parse LLM response",
+      recommendedAction: "ignore",
+      needsHumanReview: true,
     };
   }
 }

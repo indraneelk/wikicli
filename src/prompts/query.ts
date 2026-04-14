@@ -13,14 +13,14 @@ Rules:
 export function buildQueryPrompt(
   question: string,
   wikiContent: string,
-  conflicts?: RelationEntry[]
+  conflicts?: (RelationEntry & { confidence?: number })[]
 ): string {
   let content = wikiContent;
 
   if (conflicts && conflicts.length > 0) {
     const conflictNotice = `--- CONFLICT NOTICE ---
 The following articles contain contradictory claims. Acknowledge this in your answer.
-${conflicts.map(c => `CONFLICT: [[${c.source}]] vs [[${c.target}]] — ${c.evidence || 'contradictory'}`).join('\n')}
+${conflicts.map(c => `CONFLICT: [[${c.source}]] vs [[${c.target}]] — LLM confidence: ${c.confidence ? Math.round(c.confidence * 100) + "%" : "unknown"} — ${c.evidence || 'contradictory'}`).join('\n')}
 ---`;
     content = `${conflictNotice}\n\n${content}`;
   }

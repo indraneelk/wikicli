@@ -252,6 +252,82 @@ describe('lint integration', () => {
       const graphContent = readFileSync(graphPath, 'utf-8');
       assert.doesNotThrow(() => JSON.parse(graphContent), 'graph.json should be valid JSON');
     });
+
+    it('outputs new contradiction format with summary', async () => {
+      createConfigYaml(testDir);
+      createManifest(testDir, {
+        version: 1,
+        sources: {
+          'src1.md': { hash: 'h1', size_bytes: 100, added_at: '2024-01-01', compiled_at: null, summary_path: null, status: 'compiled' },
+        },
+        concepts: {
+          'concept-a': { article_path: 'wiki/concepts/concept-a.md', sources: ['src1.md'], aliases: [], last_compiled: null },
+          'concept-b': { article_path: 'wiki/concepts/concept-b.md', sources: ['src1.md'], aliases: [], last_compiled: null },
+        },
+      });
+      createGraphJson(testDir, []);
+
+      createConcept(testDir, 'concept-a', '## Definition\nTest content A with machine learning concepts.', {
+        concept: 'concept-a',
+        sources: ['src1.md'],
+        confidence: 1,
+      });
+      createConcept(testDir, 'concept-b', '## Definition\nTest content B with neural network training.', {
+        concept: 'concept-b',
+        sources: ['src1.md'],
+        confidence: 1,
+      });
+
+      const result = await runLint(testDir, ['--contradictions', '--skipLlm']);
+      const output = JSON.parse(result.stdout);
+
+      assert.ok(output.contradiction_summary, 'Should have contradiction_summary');
+      assert.ok(typeof output.contradiction_summary.candidates_checked === 'number', 'Should have candidates_checked');
+      assert.ok(typeof output.contradiction_summary.verified_contradictions === 'number', 'Should have verified_contradictions');
+      assert.ok(typeof output.contradiction_summary.pending_review === 'number', 'Should have pending_review');
+      assert.ok(typeof output.contradiction_summary.skipped_unchanged === 'number', 'Should have skipped_unchanged');
+      assert.ok(Array.isArray(output.verified_contradictions), 'Should have verified_contradictions array');
+      assert.ok(Array.isArray(output.pending_review), 'Should have pending_review array');
+    });
+  });
+
+  describe('lint incremental checking', () => {
+    it('skips unchanged pairs on second run', async () => {
+      createConfigYaml(testDir);
+      createManifest(testDir, {
+        version: 1,
+        sources: {
+          'src1.md': { hash: 'h1', size_bytes: 100, added_at: '2024-01-01', compiled_at: null, summary_path: null, status: 'compiled' },
+        },
+        concepts: {
+          'concept-a': { article_path: 'wiki/concepts/concept-a.md', sources: ['src1.md'], aliases: [], last_compiled: null },
+          'concept-b': { article_path: 'wiki/concepts/concept-b.md', sources: ['src1.md'], aliases: [], last_compiled: null },
+        },
+      });
+      createGraphJson(testDir, []);
+
+      createConcept(testDir, 'concept-a', '## Definition\nTest content A.', {
+        concept: 'concept-a',
+        sources: ['src1.md'],
+        confidence: 1,
+      });
+      createConcept(testDir, 'concept-b', '## Definition\nTest content B.', {
+        concept: 'concept-b',
+        sources: ['src1.md'],
+        confidence: 1,
+      });
+
+      const result1 = await runLint(testDir, ['--contradictions', '--skipLlm']);
+      const output1 = JSON.parse(result1.stdout);
+      const firstChecked = output1.contradiction_summary?.candidates_checked || 0;
+
+      const result2 = await runLint(testDir, ['--contradictions', '--skipLlm']);
+      const output2 = JSON.parse(result2.stdout);
+      const secondChecked = output2.contradiction_summary?.candidates_checked || 0;
+
+      assert.ok(firstChecked > 0, 'First run should check some candidates');
+      assert.ok(secondChecked < firstChecked, 'Second run should skip unchanged pairs');
+    });
   });
 
   describe('lint with missing article files', () => {

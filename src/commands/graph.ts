@@ -16,6 +16,9 @@ interface GraphEdge {
   to: string;
   type?: RelationType;
   evidence?: string;
+  confidence?: number;
+  conflictType?: string;
+  needsReview?: boolean;
 }
 
 const EDGE_COLORS: Record<string, string> = {
@@ -77,7 +80,15 @@ export const graphCommand = new Command("graph")
     }
 
     for (const r of explicitRelations) {
-      edges.push({ from: r.source, to: r.target, type: r.type, evidence: r.evidence });
+      edges.push({ 
+        from: r.source, 
+        to: r.target, 
+        type: r.type, 
+        evidence: r.evidence,
+        confidence: (r as any).confidence,
+        conflictType: (r as any).conflictType,
+        needsReview: (r as any).needsReview,
+      });
     }
 
     const filteredEdges = opts.relations
@@ -120,11 +131,18 @@ function toDot(nodes: GraphNode[], edges: GraphEdge[]): string {
   }
   for (const e of edges) {
     const style = getEdgeStyle(e.type);
-    const label = e.type ? `,label="${e.type}"` : "";
+    let label = "";
+    if (e.type) {
+      if (e.type === "contradicts" && e.confidence !== undefined) {
+        label = `,label="${e.type} (${Math.round(e.confidence * 100)}%${e.conflictType ? ", " + e.conflictType : ""})"`;
+      } else {
+        label = `,label="${e.type}"`;
+      }
+    }
     if (style) {
       lines.push(`  "${e.from}" -> "${e.to}" [${style}${label}];`);
     } else {
-      lines.push(`  "${e.from}" -> "${e.to}"${label ? ` [label="${e.type}"]` : ""};`);
+      lines.push(`  "${e.from}" -> "${e.to}"${label ? ` [${label}]` : ""};`);
     }
   }
   lines.push("}");
@@ -154,7 +172,7 @@ function toHtml(nodes: GraphNode[], edges: GraphEdge[]): string {
       arrows: 'to',
       color: e.type ? { color: edgeColors[e.type] || '#888' } : { color: '#888' },
       dashes: e.type === 'contradicts',
-      title: e.type ? 'type: ' + e.type + (e.evidence ? '\\n' + e.evidence : '') : undefined,
+      title: (e.type === 'contradicts' ? 'type: ' + e.type + (e.confidence ? '\\nconfidence: ' + Math.round(e.confidence * 100) + '%' : '') + (e.conflictType ? '\\nconflict: ' + e.conflictType : '') + (e.needsReview ? '\\nneeds review' : '') : e.type ? 'type: ' + e.type : '') + (e.evidence ? '\\n' + e.evidence : ''),
       label: e.type || undefined,
       font: { color: '#333', size: 10 }
     })));
