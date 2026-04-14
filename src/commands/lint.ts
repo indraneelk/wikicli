@@ -77,7 +77,8 @@ const lintCmd = new Command("lint")
 
       const wikilinks = content.match(/\[\[([^\]]+)\]\]/g) || [];
       for (const link of wikilinks) {
-        const slug = link.replace(/\[\[|\]\]/g, "").toLowerCase();
+        // Handle [[slug|display text]] Obsidian syntax — extract only the slug part
+        const slug = link.replace(/\[\[|\]\]/g, "").split("|")[0].trim().toLowerCase();
         if (!knownSlugs.has(slug)) {
           errors.push({ file: relPath, type: "broken-link", message: `Broken wikilink: ${link}` });
         } else {
@@ -156,10 +157,7 @@ const lintCmd = new Command("lint")
         }
       }
 
-      const candidates = generateCandidates(manifest, relations, articleCache, {
-        minSharedSources: 1,
-        minKeywordOverlap: 0.15,
-      });
+      const candidates = generateCandidates(manifest, relations, articleCache);
 
       const verifiedContradictions: VerifiedContradiction[] = [];
       const pendingReview: PendingReviewItem[] = [];

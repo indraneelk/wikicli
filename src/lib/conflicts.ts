@@ -82,9 +82,12 @@ export function generateCandidates(
   options?: { minSharedSources?: number; minKeywordOverlap?: number }
 ): ContradictionCandidate[] {
   const candidates = new Map<string, ContradictionCandidate>();
-  const minSharedSources = options?.minSharedSources ?? 1;
-  const minKeywordOverlap = options?.minKeywordOverlap ?? 0.15;
+  // Require 2+ shared sources by default: a concept pair sharing only one source
+  // is likely just co-mentioned, not genuinely in tension. Pairs that appear
+  // across multiple sources are far more likely to carry conflicting claims.
+  const minSharedSources = options?.minSharedSources ?? 2;
 
+  // Phase 1: shared-source pairs (only pairs appearing in 2+ sources together)
   const sourceToConcepts: Record<string, string[]> = {};
   for (const [slug, concept] of Object.entries(manifest.concepts)) {
     for (const src of concept.sources) {
@@ -108,6 +111,8 @@ export function generateCandidates(
     }
   }
 
+  // Phase 2: explicitly related pairs from the relation graph (wikilinks)
+  // These are already identified as related by the LLM, so always worth checking.
   for (const rel of relations) {
     const key = [rel.source, rel.target].sort().join("|");
     if (!candidates.has(key)) {
@@ -117,26 +122,15 @@ export function generateCandidates(
     }
   }
 
-  for (const [slugA, contentA] of Object.entries(articleCache)) {
-    for (const [slugB, contentB] of Object.entries(articleCache)) {
-      if (slugA >= slugB) continue;
-      const key = `${slugA}|${slugB}`;
-      let candidate = candidates.get(key);
-      const overlap = computeKeywordOverlap(contentA, contentB);
-      if (overlap >= minKeywordOverlap) {
-        if (!candidate) {
-          candidate = { slugA, slugB, sharedSources: [], keywordOverlap: overlap };
-          candidates.set(key, candidate);
-        } else {
-          candidate.keywordOverlap = overlap;
-        }
-      }
-    }
-  }
+  // NOTE: The previous O(n²) full-corpus keyword-overlap scan is intentionally
+  // removed. For large wikis (100+ concepts) it generates tens of thousands of
+  // pairs and produces mostly false positives in domain-specific corpora where
+  // every article shares high-frequency domain terms. Contradiction signal comes
+  // from structural relationships (shared sources, explicit wikilinks), not
+  // keyword co-occurrence alone.
 
-  return Array.from(candidates.values()).filter(c => 
-    c.sharedSources.length >= minSharedSources || 
-    (c.keywordOverlap ?? 0) >= minKeywordOverlap ||
+  return Array.from(candidates.values()).filter(c =>
+    c.sharedSources.length >= minSharedSources ||
     c.hasWikilink
   );
 }

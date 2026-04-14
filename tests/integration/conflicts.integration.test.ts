@@ -6,7 +6,9 @@ import type { RelationEntry } from '../../src/lib/manifest.ts';
 
 describe('conflicts integration - pure functions', () => {
   describe('generateCandidates', () => {
-    it('generates candidates from concepts with shared sources', () => {
+    it('generates candidates from concepts sharing 2+ sources', () => {
+      // minSharedSources defaults to 2 — pairs sharing only 1 source are excluded
+      // to avoid false positives from co-mentioned-but-unrelated concepts.
       const manifest: Manifest = {
         version: 1,
         sources: {
@@ -14,7 +16,7 @@ describe('conflicts integration - pure functions', () => {
           'src2.md': { hash: 'h2', size_bytes: 200, added_at: '2024-01-02', compiled_at: null, summary_path: null, status: 'compiled' },
         },
         concepts: {
-          'concept-a': { article_path: 'wiki/concepts/a.md', sources: ['src1.md'], aliases: [], last_compiled: null },
+          'concept-a': { article_path: 'wiki/concepts/a.md', sources: ['src1.md', 'src2.md'], aliases: [], last_compiled: null },
           'concept-b': { article_path: 'wiki/concepts/b.md', sources: ['src1.md', 'src2.md'], aliases: [], last_compiled: null },
         },
       };
@@ -23,12 +25,31 @@ describe('conflicts integration - pure functions', () => {
       const candidates = generateCandidates(manifest, relations, {});
 
       assert.ok(candidates.length > 0, 'Should have at least one candidate');
-      const pair = candidates.find(c => 
+      const pair = candidates.find(c =>
         (c.slugA === 'concept-a' && c.slugB === 'concept-b') ||
         (c.slugA === 'concept-b' && c.slugB === 'concept-a')
       );
-      assert.ok(pair, 'Should find candidate pair (A, B) with shared source src1');
-      assert.deepEqual(pair?.sharedSources, ['src1.md']);
+      assert.ok(pair, 'Should find candidate pair sharing both src1 and src2');
+      assert.ok(pair?.sharedSources.includes('src1.md'));
+      assert.ok(pair?.sharedSources.includes('src2.md'));
+    });
+
+    it('excludes pairs sharing only 1 source (below default minSharedSources=2)', () => {
+      const manifest: Manifest = {
+        version: 1,
+        sources: {
+          'src1.md': { hash: 'h1', size_bytes: 100, added_at: '2024-01-01', compiled_at: null, summary_path: null, status: 'compiled' },
+        },
+        concepts: {
+          'concept-a': { article_path: 'wiki/concepts/a.md', sources: ['src1.md'], aliases: [], last_compiled: null },
+          'concept-b': { article_path: 'wiki/concepts/b.md', sources: ['src1.md'], aliases: [], last_compiled: null },
+        },
+      };
+      const relations: RelationEntry[] = [];
+
+      const candidates = generateCandidates(manifest, relations, {});
+
+      assert.equal(candidates.length, 0, 'Pair sharing only 1 source should not be a candidate');
     });
 
     it('combines multiple shared sources for same pair', () => {

@@ -161,7 +161,10 @@ describe('shouldRecheck', () => {
 });
 
 describe('generateCandidates', () => {
-  it('identifies concept pairs with shared sources', () => {
+  it('identifies concept pairs sharing 2+ sources', () => {
+    // minSharedSources=2: only pairs appearing together in 2+ sources are candidates.
+    // concept-a and concept-b share src2 and src3 (2 sources) → candidate.
+    // concept-c shares no sources with a or b → excluded.
     const manifest: Manifest = {
       version: 1,
       sources: {
@@ -171,7 +174,7 @@ describe('generateCandidates', () => {
         'src4.md': { hash: 'h4', size_bytes: 400, added_at: '2024-01-04', compiled_at: null, summary_path: null, status: 'compiled' },
       },
       concepts: {
-        'concept-a': { article_path: 'a.md', sources: ['src1.md', 'src2.md'], aliases: [], last_compiled: null },
+        'concept-a': { article_path: 'a.md', sources: ['src1.md', 'src2.md', 'src3.md'], aliases: [], last_compiled: null },
         'concept-b': { article_path: 'b.md', sources: ['src2.md', 'src3.md'], aliases: [], last_compiled: null },
         'concept-c': { article_path: 'c.md', sources: ['src4.md'], aliases: [], last_compiled: null },
       },
@@ -181,13 +184,13 @@ describe('generateCandidates', () => {
     const candidates = generateCandidates(manifest, relations, {});
     const slugs = candidates.map(c => [c.slugA, c.slugB]);
 
-    assert.ok(slugs.some(([a, b]) => 
+    assert.ok(slugs.some(([a, b]) =>
       (a === 'concept-a' && b === 'concept-b') || (a === 'concept-b' && b === 'concept-a')
-    ), 'Should include (A, B) with shared src2');
-    
-    assert.ok(!slugs.some(([a, b]) => 
+    ), 'Should include (A, B) sharing src2 and src3');
+
+    assert.ok(!slugs.some(([a, b]) =>
       (a === 'concept-a' && b === 'concept-c') || (a === 'concept-c' && b === 'concept-a')
-    ), 'Should NOT include (A, C) - no shared sources');
+    ), 'Should NOT include (A, C) — no shared sources');
   });
 
   it('returns empty array for manifest with no concepts', () => {
@@ -269,7 +272,9 @@ describe('generateCandidates', () => {
     assert.ok(pair.sharedSources.length >= 2, 'Should accumulate shared sources');
   });
 
-  it('includes pairs based on keyword overlap', () => {
+  it('does NOT generate candidates from keyword overlap alone (O(n²) scan removed)', () => {
+    // The full-corpus keyword-overlap scan is removed to prevent O(n²) explosion
+    // on large wikis. Candidates now come only from shared sources and wikilinks.
     const manifest: Manifest = {
       version: 1,
       sources: {},
@@ -280,16 +285,17 @@ describe('generateCandidates', () => {
     };
     const relations: RelationEntry[] = [];
     const articleCache: Record<string, string> = {
-      'transformer': 'Transformer architecture uses self-attention mechanism to process sequential data. The model computes attention scores between all positions.',
-      'bert': 'BERT uses transformer architecture with bidirectional self-attention. It processes text by computing attention between tokens.',
+      'transformer': 'Transformer architecture uses self-attention mechanism to process sequential data.',
+      'bert': 'BERT uses transformer architecture with bidirectional self-attention.',
     };
-    const candidates = generateCandidates(manifest, relations, articleCache, { minKeywordOverlap: 0.1 });
-    assert.ok(candidates.length > 0, 'Should include pairs with keyword overlap');
-    const pair = candidates.find(c => 
+    const candidates = generateCandidates(manifest, relations, articleCache);
+    // No shared sources, no wikilinks → no candidates regardless of keyword overlap
+    assert.equal(candidates.length, 0, 'Should not generate candidates from keyword overlap alone');
+    const pair = candidates.find(c =>
       (c.slugA === 'transformer' && c.slugB === 'bert') ||
       (c.slugA === 'bert' && c.slugB === 'transformer')
     );
-    assert.ok(pair, 'Should find transformer-bert pair');
-    assert.ok((pair.keywordOverlap ?? 0) > 0, 'Should have keywordOverlap set');
+    assert.equal(pair, undefined, 'transformer-bert pair should not be a candidate without shared sources or wikilinks');
+    // keywordOverlap field is intentionally not set
   });
 });

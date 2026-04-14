@@ -294,14 +294,16 @@ describe('lint integration', () => {
   describe('lint incremental checking', () => {
     it('skips unchanged pairs on second run', async () => {
       createConfigYaml(testDir);
+      // Both concepts must share 2+ sources to be candidates (minSharedSources=2)
       createManifest(testDir, {
         version: 1,
         sources: {
           'src1.md': { hash: 'h1', size_bytes: 100, added_at: '2024-01-01', compiled_at: null, summary_path: null, status: 'compiled' },
+          'src2.md': { hash: 'h2', size_bytes: 100, added_at: '2024-01-01', compiled_at: null, summary_path: null, status: 'compiled' },
         },
         concepts: {
-          'concept-a': { article_path: 'wiki/concepts/concept-a.md', sources: ['src1.md'], aliases: [], last_compiled: null },
-          'concept-b': { article_path: 'wiki/concepts/concept-b.md', sources: ['src1.md'], aliases: [], last_compiled: null },
+          'concept-a': { article_path: 'wiki/concepts/concept-a.md', sources: ['src1.md', 'src2.md'], aliases: [], last_compiled: null },
+          'concept-b': { article_path: 'wiki/concepts/concept-b.md', sources: ['src1.md', 'src2.md'], aliases: [], last_compiled: null },
         },
       });
       createGraphJson(testDir, []);
