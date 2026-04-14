@@ -3,6 +3,7 @@ import { join } from "path";
 import { loadConfig } from "../lib/config.js";
 import { loadManifest, saveManifest, upsertConcept, upsertRelation, loadRelations, saveRelations } from "../lib/manifest.js";
 import { hashFile } from "../lib/hash.js";
+import { existsSync } from "fs";
 import { readText, writeText, ensureDir, listMarkdownFiles } from "../lib/files.js";
 import { slugify } from "../lib/slug.js";
 import { llmCall, OPENCODE_FREE_MODELS } from "../lib/llm.js";
@@ -131,6 +132,38 @@ async function summarizeSource(
   return { ok: true, summaryPath, concepts };
 }
 
+interface ReviewQueueItem {
+  slugA: string;
+  slugB: string;
+  addedAt: string;
+  confidence?: number;
+  conflictType?: string;
+  contradictions?: unknown[];
+  explanation?: string;
+  recommendedAction?: string;
+  status: "pending" | "confirmed" | "dismissed";
+  notes?: string;
+}
+
+interface ReviewQueue {
+  pending: ReviewQueueItem[];
+  confirmed: ReviewQueueItem[];
+  dismissed: ReviewQueueItem[];
+}
+
+const REVIEW_QUEUE_PATH = ".wikic/review_queue.json";
+
+function loadReviewQueue(dir: string): ReviewQueue {
+  const p = join(dir, REVIEW_QUEUE_PATH);
+  if (!existsSync(p)) return { pending: [], confirmed: [], dismissed: [] };
+  return JSON.parse(readText(p));
+}
+
+function saveReviewQueue(dir: string, queue: ReviewQueue): void {
+  const p = join(dir, REVIEW_QUEUE_PATH);
+  writeText(p, JSON.stringify(queue, null, 2));
+}
+
 async function runContradictionCheck(
   dir: string,
   config: import("../lib/config.js").WikicConfig,
@@ -157,12 +190,20 @@ async function runContradictionCheck(
   const candidates = generateCandidates(manifest, relationsArr, articleCache);
   const checkedPairs = loadCheckedPairs(dir);
   const updatedPairs: typeof checkedPairs = [];
+  const queue = loadReviewQueue(dir);
 
   let candidatesChecked = 0;
   let verified = 0;
   let pendingReview = 0;
   let skipped = 0;
   let errors = 0;
+
+  const alreadyInQueue = (slugA: string, slugB: string): boolean => {
+    const key = [slugA, slugB].sort().join("|");
+    return [...queue.pending, ...queue.confirmed, ...queue.dismissed].some(
+      (i) => [i.slugA, i.slugB].sort().join("|") === key
+    );
+  };
 
   for (const candidate of candidates) {
     const contentA = articleCache[candidate.slugA];
@@ -193,10 +234,43 @@ async function runContradictionCheck(
         config
       );
 
-      if (result.verified) {
+      const pairKey = [candidate.slugA, candidate.slugB].sort().join("|");
+
+      if (result.verified && result.confidence >= 0.8 && !result.needsHumanReview) {
         verified++;
-      } else if (result.needsHumanReview) {
+        if (!alreadyInQueue(candidate.slugA, candidate.slugB)) {
+          upsertRelation(
+            manifest,
+            relationsArr,
+            candidate.slugA,
+            candidate.slugB,
+            "contradicts",
+            result.explanation || `Verified contradiction (confidence: ${Math.round(result.confidence * 100)}%)`
+          );
+          const rel = relationsArr.find(
+            (r) => r.source === candidate.slugA && r.target === candidate.slugB && r.type === "contradicts"
+          );
+          if (rel) {
+            (rel as unknown as Record<string, unknown>).confidence = result.confidence;
+            (rel as unknown as Record<string, unknown>).conflictType = result.contradictions?.[0]?.conflictType;
+            (rel as unknown as Record<string, unknown>).reviewed = true;
+          }
+        }
+      } else if (result.confidence >= 0.5 || result.needsHumanReview) {
         pendingReview++;
+        if (!alreadyInQueue(candidate.slugA, candidate.slugB)) {
+          queue.pending.push({
+            slugA: candidate.slugA,
+            slugB: candidate.slugB,
+            addedAt: new Date().toISOString(),
+            confidence: result.confidence,
+            conflictType: result.contradictions?.[0]?.conflictType,
+            contradictions: result.contradictions as unknown as unknown[],
+            explanation: result.explanation,
+            recommendedAction: result.recommendedAction,
+            status: "pending",
+          });
+        }
       }
 
       updatedPairs.push({
@@ -221,6 +295,7 @@ async function runContradictionCheck(
   }
 
   saveCheckedPairs(dir, updatedPairs);
+  saveReviewQueue(dir, queue);
 
   return { candidatesChecked, verified, pendingReview, skipped, errors };
 }

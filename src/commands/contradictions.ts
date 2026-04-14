@@ -13,7 +13,7 @@ export interface ReviewItem {
   addedAt: string;
   confidence?: number;
   conflictType?: string;
-  conflicts?: unknown[];
+  contradictions?: unknown[];
   explanation?: string;
   recommendedAction?: string;
   reviewedAt?: string;
