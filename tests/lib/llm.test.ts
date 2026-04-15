@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { OPENCODE_FREE_MODELS, extractOpencodeText } from '../../src/lib/llm.ts';
+import { OPENCODE_FREE_MODELS, extractOpencodeText, extractCodexText } from '../../src/lib/llm.ts';
 
 describe('OPENCODE_FREE_MODELS', () => {
   it('contains exactly 3 entries', () => {
@@ -51,5 +51,48 @@ describe('extractOpencodeText', () => {
       '{"type":"text","part":{"type":"text","text":"OK"}}',
     ].join('\n');
     assert.equal(extractOpencodeText(output), 'OK');
+  });
+});
+
+// Verified against codex exec --json output format:
+// { "type": "item.completed", "item": { "type": "agent_message", "text": "..." } }
+describe('extractCodexText', () => {
+  it('extracts text from agent_message item.completed events', () => {
+    const output = [
+      '{"type":"thread.started","thread_id":"abc123"}',
+      '{"type":"turn.started"}',
+      '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello world"}}',
+      '{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":5}}',
+    ].join('\n');
+    assert.equal(extractCodexText(output), 'Hello world');
+  });
+
+  it('concatenates multiple agent_message events', () => {
+    const output = [
+      '{"type":"item.completed","item":{"type":"agent_message","text":"Part one. "}}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"Part two."}}',
+    ].join('\n');
+    assert.equal(extractCodexText(output), 'Part one. Part two.');
+  });
+
+  it('ignores non-agent_message item types', () => {
+    const output = [
+      '{"type":"item.completed","item":{"type":"tool_call","text":"ignored"}}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"kept"}}',
+    ].join('\n');
+    assert.equal(extractCodexText(output), 'kept');
+  });
+
+  it('falls back to raw stdout when no structured events found', () => {
+    const output = 'plain text response';
+    assert.equal(extractCodexText(output), 'plain text response');
+  });
+
+  it('handles malformed JSON lines gracefully', () => {
+    const output = [
+      'not json',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}',
+    ].join('\n');
+    assert.equal(extractCodexText(output), 'OK');
   });
 });

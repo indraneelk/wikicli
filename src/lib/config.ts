@@ -9,7 +9,7 @@ export interface WikicConfig {
   sources_dir: string;
   output_dir: string;
   llm: {
-    provider: "claude-cli" | "anthropic" | "openai" | "ollama" | "opencode-cli";
+    provider: "claude-cli" | "anthropic" | "openai" | "ollama" | "opencode-cli" | "codex-cli";
     model?: string;
   };
   compiler: {

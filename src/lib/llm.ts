@@ -35,11 +35,13 @@ export async function llmCall(
         userMessage,
         cfg.llm.model ?? OPENCODE_FREE_MODELS[0]
       );
+    case "codex-cli":
+      return codexCliCall(systemPrompt, userMessage, cfg.llm.model);
     default:
       return {
         text: "",
         ok: false,
-        error: `Provider "${provider}" not yet implemented. Use "claude-cli" or "opencode-cli".`,
+        error: `Provider "${provider}" not yet implemented. Use "claude-cli", "opencode-cli", or "codex-cli".`,
       };
   }
 }
@@ -116,6 +118,82 @@ async function opencodeCliCall(
       });
     });
   });
+}
+
+async function codexCliCall(
+  systemPrompt: string,
+  userMessage: string,
+  model?: string
+): Promise<LLMResponse> {
+  const combinedPrompt = `${systemPrompt}\n\n---\n\n${userMessage}`;
+  // codex exec reads the prompt from stdin when `-` is passed.
+  // --sandbox read-only prevents interactive approval prompts for shell commands.
+  // --json streams JSONL events; we extract text from item.completed agent_message events.
+  const args = ["exec", "-", "--dangerously-bypass-approvals-and-sandbox", "--json"];
+  if (model) args.push("--model", model);
+
+  return new Promise((resolve) => {
+    const child = spawn("codex", args, {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdin.write(combinedPrompt);
+    child.stdin.end();
+
+    child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+
+    child.on("close", (code) => {
+      if (code !== 0) {
+        resolve({
+          text: "",
+          ok: false,
+          error: `codex error (exit ${code}): ${stderr.slice(0, 500)}`,
+        });
+        return;
+      }
+      resolve({ text: extractCodexText(stdout).trim(), ok: true });
+    });
+
+    child.on("error", (err) => {
+      resolve({
+        text: "",
+        ok: false,
+        error: `codex spawn error: ${err.message}`,
+      });
+    });
+  });
+}
+
+/**
+ * Extracts assistant text from codex exec --json JSONL event stream.
+ * Text events: { "type": "item.completed", "item": { "type": "agent_message", "text": "..." } }
+ * Falls back to raw stdout if no structured events are found.
+ */
+export function extractCodexText(output: string): string {
+  const lines = output.split('\n').filter(l => l.trim());
+  const parts: string[] = [];
+
+  for (const line of lines) {
+    try {
+      const event = JSON.parse(line);
+      if (
+        event.type === 'item.completed' &&
+        event.item?.type === 'agent_message' &&
+        typeof event.item.text === 'string'
+      ) {
+        parts.push(event.item.text);
+      }
+    } catch {
+      // non-JSON line — skip
+    }
+  }
+
+  if (parts.length > 0) return parts.join('');
+  return output; // fallback: return raw stdout
 }
 
 /**
