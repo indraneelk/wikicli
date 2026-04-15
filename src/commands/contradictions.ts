@@ -2,7 +2,8 @@ import { Command } from "commander";
 import { join } from "path";
 import { existsSync, mkdirSync } from "fs";
 import { loadManifest, loadRelations, saveRelations, upsertRelation } from "../lib/manifest.js";
-import { loadCheckedPairs } from "../lib/conflicts.js";
+import { loadCheckedPairs, saveCheckedPairs, generateCandidates, extractClaims, verifyContradiction, hashContent } from "../lib/conflicts.js";
+import { loadConfig } from "../lib/config.js";
 import { readText, writeText } from "../lib/files.js";
 
 const REVIEW_QUEUE_PATH = ".wikic/review_queue.json";
@@ -274,6 +275,162 @@ const dismissSubCommand = new Command("dismiss")
     console.log(JSON.stringify({ ok: true, action: "dismissed", slugA, slugB }));
   });
 
+// wikic contradictions check <slugA> <slugB>          — direct pair
+// wikic contradictions check --source sources/H1.md   — all concepts from that source
+// wikic contradictions check --concept event-study     — concept vs its neighbors
+const checkSubCommand = new Command("check")
+  .description("Run contradiction check on a specific pair, source, or concept")
+  .argument("[slugA]", "First concept slug (for direct pair check)")
+  .argument("[slugB]", "Second concept slug (for direct pair check)")
+  .option("--source <path>", "Check all concepts that came from this source file against each other")
+  .option("--concept <slug>", "Check this concept against all concepts it shares sources with")
+  .option("--skipLlm", "Only generate candidates, skip LLM verification")
+  .action(async (slugA: string | undefined, slugB: string | undefined, opts) => {
+    const dir = process.cwd();
+    const config = loadConfig(dir);
+    const manifest = loadManifest(dir);
+    const relations = loadRelations(dir);
+    const queue = loadReviewQueue(dir);
+
+    // Build article cache
+    const articleCache: Record<string, string> = {};
+    for (const [slug, info] of Object.entries(manifest.concepts)) {
+      try { articleCache[slug] = readText(join(dir, info.article_path)); } catch { articleCache[slug] = ""; }
+    }
+
+    // Determine which pairs to check
+    type Pair = { slugA: string; slugB: string };
+    let pairs: Pair[] = [];
+
+    if (slugA && slugB) {
+      // Direct pair
+      if (!manifest.concepts[slugA]) {
+        console.log(JSON.stringify({ ok: false, error: `Concept not found: ${slugA}` }));
+        return;
+      }
+      if (!manifest.concepts[slugB]) {
+        console.log(JSON.stringify({ ok: false, error: `Concept not found: ${slugB}` }));
+        return;
+      }
+      pairs = [{ slugA, slugB }];
+    } else if (opts.source) {
+      // All concepts from this source, checked against each other
+      const sourcePath = opts.source.startsWith("/") ? opts.source.replace(dir + "/", "") : opts.source;
+      const slugs = Object.entries(manifest.concepts)
+        .filter(([, info]) => info.sources.includes(sourcePath))
+        .map(([slug]) => slug);
+      if (slugs.length < 2) {
+        console.log(JSON.stringify({ ok: false, error: `Fewer than 2 concepts found for source: ${sourcePath}`, slugs }));
+        return;
+      }
+      for (let i = 0; i < slugs.length; i++) {
+        for (let j = i + 1; j < slugs.length; j++) {
+          pairs.push({ slugA: slugs[i], slugB: slugs[j] });
+        }
+      }
+    } else if (opts.concept) {
+      // This concept vs all concepts it shares sources with (1+ shared source)
+      const concept = manifest.concepts[opts.concept];
+      if (!concept) {
+        console.log(JSON.stringify({ ok: false, error: `Concept not found: ${opts.concept}` }));
+        return;
+      }
+      const sourceSet = new Set(concept.sources);
+      const neighbors = new Set<string>();
+      for (const [slug, info] of Object.entries(manifest.concepts)) {
+        if (slug === opts.concept) continue;
+        if (info.sources.some(s => sourceSet.has(s))) neighbors.add(slug);
+      }
+      pairs = Array.from(neighbors).map(neighbor => ({ slugA: opts.concept, slugB: neighbor }));
+    } else {
+      console.log(JSON.stringify({ ok: false, error: "Provide two slug arguments, --source, or --concept" }));
+      return;
+    }
+
+    const results: unknown[] = [];
+    let checked = 0;
+    let skipped = 0;
+    const checkedPairs = loadCheckedPairs(dir);
+    const updatedPairs = [...checkedPairs];
+
+    for (const pair of pairs) {
+      const contentA = articleCache[pair.slugA] || "";
+      const contentB = articleCache[pair.slugB] || "";
+      if (!contentA || !contentB) { skipped++; continue; }
+
+      if (opts.skipLlm) {
+        results.push({ slugA: pair.slugA, slugB: pair.slugB, status: "candidate_only" });
+        checked++;
+        continue;
+      }
+
+      try {
+        const claimsA = await extractClaims(contentA, pair.slugA, config);
+        const claimsB = await extractClaims(contentB, pair.slugB, config);
+        const result = await verifyContradiction(pair.slugA, claimsA, pair.slugB, claimsB, config);
+
+        checked++;
+        const entry: Record<string, unknown> = {
+          slugA: pair.slugA,
+          slugB: pair.slugB,
+          verified: result.verified,
+          confidence: result.confidence,
+          explanation: result.explanation,
+          recommendedAction: result.recommendedAction,
+          needsHumanReview: result.needsHumanReview,
+          contradictions: result.contradictions,
+        };
+
+        // Auto-add high-confidence results to graph + queue
+        const key = [pair.slugA, pair.slugB].sort().join("|");
+        const alreadyQueued = [...queue.pending, ...queue.confirmed, ...queue.dismissed]
+          .some(i => [i.slugA, i.slugB].sort().join("|") === key);
+
+        if (result.verified && result.confidence >= 0.8 && !result.needsHumanReview && !alreadyQueued) {
+          upsertRelation(manifest, relations, pair.slugA, pair.slugB, "contradicts",
+            result.explanation || `Verified contradiction (confidence: ${Math.round(result.confidence * 100)}%)`);
+          entry.action = "added_to_graph";
+        } else if ((result.confidence >= 0.5 || result.needsHumanReview) && !alreadyQueued) {
+          queue.pending.push({
+            slugA: pair.slugA, slugB: pair.slugB,
+            addedAt: new Date().toISOString(),
+            confidence: result.confidence,
+            conflictType: (result.contradictions as Array<{conflictType?: string}>)?.[0]?.conflictType,
+            contradictions: result.contradictions as unknown[],
+            explanation: result.explanation,
+            recommendedAction: result.recommendedAction,
+            status: "pending",
+          });
+          entry.action = "added_to_review_queue";
+        }
+
+        updatedPairs.push({
+          slugA: pair.slugA, slugB: pair.slugB,
+          articleHashA: hashContent(contentA), articleHashB: hashContent(contentB),
+          lastChecked: new Date().toISOString(),
+          previouslyVerified: result.verified,
+        });
+
+        results.push(entry);
+      } catch (e) {
+        skipped++;
+        results.push({ slugA: pair.slugA, slugB: pair.slugB, error: String(e) });
+      }
+    }
+
+    saveCheckedPairs(dir, updatedPairs);
+    saveReviewQueue(dir, queue);
+    saveRelations(dir, relations);
+
+    console.log(JSON.stringify({
+      ok: true,
+      pairs_checked: checked,
+      pairs_skipped: skipped,
+      results,
+    }, null, 2));
+  });
+
+contradictionsCommand.addCommand(checkSubCommand);
 contradictionsCommand.addCommand(reviewSubCommand);
 contradictionsCommand.addCommand(confirmSubCommand);
 contradictionsCommand.addCommand(dismissSubCommand);

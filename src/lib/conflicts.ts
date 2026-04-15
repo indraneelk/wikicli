@@ -129,10 +129,24 @@ export function generateCandidates(
   // from structural relationships (shared sources, explicit wikilinks), not
   // keyword co-occurrence alone.
 
-  return Array.from(candidates.values()).filter(c =>
-    c.sharedSources.length >= minSharedSources ||
-    c.hasWikilink
-  );
+  // Phase 3: keyword overlap post-filter — applied to source-based candidates only.
+  // Wikilink pairs bypass this filter (they're already known to be related).
+  // Pairs where the article cache is missing for either slug also bypass it.
+  // This eliminates pairs that share sources but discuss entirely different topics.
+  const minKeywordOverlap = options?.minKeywordOverlap ?? 0.15;
+
+  return Array.from(candidates.values()).filter(c => {
+    if (!(c.sharedSources.length >= minSharedSources || c.hasWikilink)) return false;
+    // Wikilinks always pass — the LLM already identified the relationship.
+    if (c.hasWikilink) return true;
+    // No article cache? Can't compute overlap, allow through.
+    const contentA = articleCache[c.slugA];
+    const contentB = articleCache[c.slugB];
+    if (!contentA || !contentB) return true;
+    const overlap = computeKeywordOverlap(contentA, contentB);
+    c.keywordOverlap = overlap;
+    return overlap >= minKeywordOverlap;
+  });
 }
 
 export function simpleExtractFacts(content: string): Fact[] {

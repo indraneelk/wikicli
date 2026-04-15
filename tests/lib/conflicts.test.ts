@@ -272,6 +272,74 @@ describe('generateCandidates', () => {
     assert.ok(pair.sharedSources.length >= 2, 'Should accumulate shared sources');
   });
 
+  it('filters out source-based candidates whose article content has low keyword overlap', () => {
+    // Two concepts share 2 sources but their articles discuss entirely different topics.
+    // The keyword post-filter should drop this pair, reducing LLM calls.
+    const manifest: Manifest = {
+      version: 1,
+      sources: {
+        'src1.md': { hash: 'h1', size_bytes: 100, added_at: '2024-01-01', compiled_at: null, summary_path: null, status: 'compiled' },
+        'src2.md': { hash: 'h2', size_bytes: 200, added_at: '2024-01-02', compiled_at: null, summary_path: null, status: 'compiled' },
+      },
+      concepts: {
+        'event-study': { article_path: 'event-study.md', sources: ['src1.md', 'src2.md'], aliases: [], last_compiled: null },
+        'kelly-criterion': { article_path: 'kelly.md', sources: ['src1.md', 'src2.md'], aliases: [], last_compiled: null },
+      },
+    };
+    const relations: RelationEntry[] = [];
+    const articleCache: Record<string, string> = {
+      'event-study': 'Event study methodology measures abnormal returns around corporate events using market model regression.',
+      'kelly-criterion': 'Kelly criterion optimizes position sizing through logarithmic utility maximization for bankroll growth.',
+    };
+    const candidates = generateCandidates(manifest, relations, articleCache);
+    // These share 2 sources but content is entirely different topics — filtered out
+    assert.equal(candidates.length, 0, 'Low-overlap source-based pair should be filtered out');
+  });
+
+  it('keeps source-based candidates with high keyword overlap', () => {
+    const manifest: Manifest = {
+      version: 1,
+      sources: {
+        'src1.md': { hash: 'h1', size_bytes: 100, added_at: '2024-01-01', compiled_at: null, summary_path: null, status: 'compiled' },
+        'src2.md': { hash: 'h2', size_bytes: 200, added_at: '2024-01-02', compiled_at: null, summary_path: null, status: 'compiled' },
+      },
+      concepts: {
+        'event-study': { article_path: 'event-study.md', sources: ['src1.md', 'src2.md'], aliases: [], last_compiled: null },
+        'cumulative-abnormal-return': { article_path: 'car.md', sources: ['src1.md', 'src2.md'], aliases: [], last_compiled: null },
+      },
+    };
+    const relations: RelationEntry[] = [];
+    const articleCache: Record<string, string> = {
+      'event-study': 'Event study methodology measures abnormal return using market model regression around corporate events.',
+      'cumulative-abnormal-return': 'Cumulative abnormal return aggregates abnormal returns over event window using market model benchmark.',
+    };
+    const candidates = generateCandidates(manifest, relations, articleCache);
+    assert.equal(candidates.length, 1, 'High-overlap source-based pair should pass the filter');
+    assert.ok(candidates[0].keywordOverlap !== undefined, 'keywordOverlap should be set on filtered candidate');
+    assert.ok(candidates[0].keywordOverlap! > 0.15, 'Overlap should exceed default threshold');
+  });
+
+  it('wikilink-based candidates bypass the keyword overlap filter', () => {
+    // Even if articles have low overlap, wikilinks indicate a known relationship worth checking.
+    const manifest: Manifest = {
+      version: 1,
+      sources: {},
+      concepts: {
+        'concept-a': { article_path: 'a.md', sources: [], aliases: [], last_compiled: null },
+        'concept-b': { article_path: 'b.md', sources: [], aliases: [], last_compiled: null },
+      },
+    };
+    const relations: RelationEntry[] = [
+      { id: '1', source: 'concept-a', target: 'concept-b', type: 'extends', created_at: '2024-01-01T00:00:00Z' },
+    ];
+    const articleCache: Record<string, string> = {
+      'concept-a': 'Quantum physics describes subatomic particles and wave functions.',
+      'concept-b': 'Renaissance painting techniques used egg tempera and oil glazing.',
+    };
+    const candidates = generateCandidates(manifest, relations, articleCache);
+    assert.equal(candidates.length, 1, 'Wikilink pair should not be filtered regardless of overlap');
+  });
+
   it('does NOT generate candidates from keyword overlap alone (O(n²) scan removed)', () => {
     // The full-corpus keyword-overlap scan is removed to prevent O(n²) explosion
     // on large wikis. Candidates now come only from shared sources and wikilinks.
