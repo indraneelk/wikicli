@@ -1,6 +1,7 @@
 import { Command } from "commander";
 import { join } from "path";
 import { loadConfig } from "../lib/config.js";
+import type { WikicConfig } from "../lib/config.js";
 import { loadManifest, saveManifest, upsertConcept, upsertRelation, loadRelations, saveRelations } from "../lib/manifest.js";
 import { hashFile } from "../lib/hash.js";
 import { existsSync } from "fs";
@@ -168,7 +169,8 @@ async function runContradictionCheck(
   dir: string,
   config: import("../lib/config.js").WikicConfig,
   manifest: import("../lib/manifest.js").Manifest,
-  relationsArr: import("../lib/manifest.js").RelationEntry[]
+  relationsArr: import("../lib/manifest.js").RelationEntry[],
+  processedSources?: string[]
 ): Promise<{
   candidatesChecked: number;
   verified: number;
@@ -187,7 +189,21 @@ async function runContradictionCheck(
     }
   }
 
-  const candidates = generateCandidates(manifest, relationsArr, articleCache);
+  let candidates = generateCandidates(manifest, relationsArr, articleCache);
+
+  // Scope to concepts from the just-processed sources, if provided.
+  // This means compiling 1 source only checks the ~5-10 concepts it produced,
+  // not every pair in the entire wiki.
+  if (processedSources && processedSources.length > 0) {
+    const processedSet = new Set(processedSources);
+    const affectedSlugs = new Set(
+      Object.entries(manifest.concepts)
+        .filter(([, info]) => info.sources.some(s => processedSet.has(s)))
+        .map(([slug]) => slug)
+    );
+    candidates = candidates.filter(c => affectedSlugs.has(c.slugA) || affectedSlugs.has(c.slugB));
+  }
+
   const checkedPairs = loadCheckedPairs(dir);
   const updatedPairs: typeof checkedPairs = [];
   const queue = loadReviewQueue(dir);
@@ -303,18 +319,28 @@ async function runContradictionCheck(
 export const compileCommand = new Command("compile")
   .description("Compile sources into wiki articles")
   .option("--full", "Force full recompilation")
+  .option("--repair", "Write articles for any concepts missing their article file (no re-summarization)")
   .option(
     "--model <id>",
     "Override LLM model for this run (does not modify config.yaml).\n" +
     "Free opencode models:\n" +
     OPENCODE_FREE_MODELS.map((m) => `  ${m}`).join("\n")
   )
+  .option(
+    "--provider <name>",
+    "Override LLM provider for this run (does not modify config.yaml).\n" +
+    "Supported: claude-cli, opencode-cli, codex-cli"
+  )
   .action(async (opts) => {
     const dir = process.cwd();
     const baseConfig = loadConfig(dir);
-    const config = opts.model
-      ? { ...baseConfig, llm: { ...baseConfig.llm, model: opts.model as string } }
-      : baseConfig;
+    let config = baseConfig;
+    if (opts.provider) {
+      config = { ...config, llm: { ...config.llm, provider: opts.provider as WikicConfig["llm"]["provider"] } };
+    }
+    if (opts.model) {
+      config = { ...config, llm: { ...config.llm, model: opts.model as string } };
+    }
     const manifest = loadManifest(dir);
     const relations = loadRelations(dir);
     const stats: CompileStats = {
@@ -342,6 +368,57 @@ export const compileCommand = new Command("compile")
       } catch {
         stats.errors.push(`Cannot read source: ${path}`);
       }
+    }
+
+    if (opts.repair) {
+      // Write articles for concepts that exist in manifest but have no article file
+      const missingConcepts = Object.entries(manifest.concepts).filter(
+        ([, info]) => !existsSync(join(dir, info.article_path))
+      );
+      if (missingConcepts.length === 0) {
+        console.log(JSON.stringify({ ok: true, message: "No missing articles found.", articles_written: 0 }));
+        return;
+      }
+      console.error(`Writing ${missingConcepts.length} missing articles...`);
+      const allSlugs = Object.keys(manifest.concepts);
+      let repairWritten = 0;
+      const repairErrors: string[] = [];
+      await runParallel(missingConcepts, config.compiler.max_parallel, async ([slug, info]) => {
+        console.error(`  Writing article: ${slug}...`);
+        const sourceMaterial: string[] = [];
+        for (const sp of info.sources) {
+          const entry = manifest.sources[sp];
+          if (entry?.summary_path) {
+            try { sourceMaterial.push(readText(join(dir, entry.summary_path))); } catch { /* skip */ }
+          }
+        }
+        const conceptName = (info.aliases ?? [])[0] ?? slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        const resp = await llmCall(
+          WRITE_AND_RELATE_SYSTEM,
+          buildWriteAndRelatePrompt(
+            conceptName,
+            slug,
+            info.aliases ?? [],
+            info.sources,
+            "medium",
+            sourceMaterial.join("\n\n---\n\n"),
+            allSlugs
+          ),
+          config
+        );
+        if (!resp.ok) { repairErrors.push(`Write failed for ${slug}: ${resp.error}`); return; }
+        const { article, relations: parsedRelations } = parseWriteAndRelateResponse(resp.text);
+        writeText(join(dir, info.article_path), article);
+        for (const rel of parsedRelations) {
+          upsertRelation(manifest, relations, slug, rel.target, rel.type as import("../lib/manifest.js").RelationType, rel.evidence ?? "");
+        }
+        manifest.concepts[slug].last_compiled = new Date().toISOString();
+        repairWritten++;
+      });
+      saveManifest(dir, manifest);
+      saveRelations(dir, relations);
+      console.log(JSON.stringify({ ok: true, articles_written: repairWritten, errors: repairErrors }));
+      return;
     }
 
     if (toProcess.length === 0) {
@@ -467,11 +544,19 @@ export const compileCommand = new Command("compile")
     if (config.compiler.auto_lint !== false && toProcess.length > 0) {
       console.error('  Running contradiction check...');
       try {
-        const cStats = await runContradictionCheck(dir, config, manifest, relations);
+        const cStats = await runContradictionCheck(dir, config, manifest, relations, toProcess);
         if (cStats.verified > 0 || cStats.pendingReview > 0) {
           console.error(`  Contradictions: ${cStats.verified} verified, ${cStats.pendingReview} pending review, ${cStats.skipped} skipped (unchanged)`);
         }
         stats.contradiction_stats = cStats;
+        // Update lint tracking on successfully processed sources
+        const lintTimestamp = new Date().toISOString();
+        for (const sp of toProcess) {
+          if (manifest.sources[sp] && manifest.sources[sp].status !== "error") {
+            manifest.sources[sp].lint_at = lintTimestamp;
+            manifest.sources[sp].lint_status = cStats.pendingReview > 0 ? "flagged" : "clean";
+          }
+        }
       } catch (e) {
         console.error(`  Contradiction check failed: ${e}`);
         stats.contradiction_stats = { candidatesChecked: 0, verified: 0, pendingReview: 0, skipped: 0, errors: 1 };
@@ -484,6 +569,9 @@ export const compileCommand = new Command("compile")
         manifest.sources[sp].status = "compiled";
       }
     }
+
+    // Step 8: Generate sources index
+    generateSourcesIndex(dir, config.sources_dir, manifest);
 
     saveRelations(dir, relations);
     saveManifest(dir, manifest);
@@ -583,4 +671,66 @@ ${stats.errors.length > 0 ? stats.errors.map((e) => `  - ${e}`).join("\n") : ""}
 `;
 
   writeText(join(dir, changelogPath), existing + entry);
+}
+
+function generateSourcesIndex(dir: string, sourcesDir: string, manifest: import("../lib/manifest.js").Manifest): void {
+  const now = new Date().toISOString();
+  const entries = Object.entries(manifest.sources).sort(([a], [b]) => a.localeCompare(b));
+
+  const compiled   = entries.filter(([, e]) => e.status === "compiled");
+  const pending    = entries.filter(([, e]) => e.status === "pending");
+  const errored    = entries.filter(([, e]) => e.status === "error");
+  const flagged    = entries.filter(([, e]) => (e.lint_status ?? "unchecked") === "flagged");
+  const unchecked  = entries.filter(([, e]) => (e.lint_status ?? "unchecked") === "unchecked");
+
+  const lines: string[] = [
+    `# Sources Index`,
+    ``,
+    `_Auto-generated ${now}_`,
+    ``,
+    `## Summary`,
+    ``,
+    `| Metric | Count |`,
+    `|--------|-------|`,
+    `| Total sources | ${entries.length} |`,
+    `| Compiled | ${compiled.length} |`,
+    `| Pending | ${pending.length} |`,
+    `| Errors | ${errored.length} |`,
+    `| Lint: flagged | ${flagged.length} |`,
+    `| Lint: unchecked | ${unchecked.length} |`,
+    ``,
+    `## All Sources`,
+    ``,
+    `| Source | Status | Compiled At | Lint Status | Lint At | Size |`,
+    `|--------|--------|-------------|-------------|---------|------|`,
+  ];
+
+  for (const [path, entry] of entries) {
+    const status      = entry.status;
+    const compiledAt  = entry.compiled_at ? entry.compiled_at.slice(0, 10) : "—";
+    const lintStatus  = entry.lint_status ?? "unchecked";
+    const lintAt      = entry.lint_at ? entry.lint_at.slice(0, 10) : "—";
+    const sizeKb      = (entry.size_bytes / 1024).toFixed(1);
+    const statusEmoji = status === "compiled" ? "✅" : status === "error" ? "❌" : "⏳";
+    const lintEmoji   = lintStatus === "clean" ? "✅" : lintStatus === "flagged" ? "⚠️" : "—";
+    const name        = path.replace(/^sources\//, "");
+    lines.push(`| \`${name}\` | ${statusEmoji} ${status} | ${compiledAt} | ${lintEmoji} ${lintStatus} | ${lintAt} | ${sizeKb}KB |`);
+  }
+
+  if (errored.length > 0) {
+    lines.push(``, `## Errors`, ``);
+    for (const [path] of errored) {
+      lines.push(`- \`${path}\``);
+    }
+  }
+
+  if (flagged.length > 0) {
+    lines.push(``, `## Flagged for Contradiction Review`, ``);
+    for (const [path, entry] of flagged) {
+      lines.push(`- \`${path}\` — flagged ${entry.lint_at ?? "unknown"}`);
+    }
+  }
+
+  lines.push(``);
+  writeText(join(dir, sourcesDir, "_index.md"), lines.join("\n"));
 }

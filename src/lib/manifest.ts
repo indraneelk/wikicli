@@ -8,6 +8,8 @@ export interface SourceEntry {
   compiled_at: string | null;
   summary_path: string | null;
   status: "pending" | "compiled" | "error";
+  lint_at: string | null;
+  lint_status: "clean" | "flagged" | "unchecked";
 }
 
 export interface ConceptEntry {
@@ -78,6 +80,8 @@ export function addSource(
     compiled_at: null,
     summary_path: null,
     status: "pending",
+    lint_at: null,
+    lint_status: "unchecked",
   };
 }
 
