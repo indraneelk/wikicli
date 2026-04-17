@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { OPENCODE_FREE_MODELS, extractOpencodeText, extractCodexText } from '../../src/lib/llm.ts';
+import { listProviderModels } from '../../src/lib/models.ts';
 
 describe('OPENCODE_FREE_MODELS', () => {
   it('contains exactly 3 entries', () => {
@@ -94,5 +95,45 @@ describe('extractCodexText', () => {
       '{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}',
     ].join('\n');
     assert.equal(extractCodexText(output), 'OK');
+  });
+});
+
+describe('listProviderModels', () => {
+  it('returns non-empty array for opencode-cli', () => {
+    const models = listProviderModels('opencode-cli');
+    assert.ok(Array.isArray(models));
+    assert.ok(models.length > 0);
+  });
+
+  it('opencode-cli models include minimax-m2.5-free', () => {
+    const models = listProviderModels('opencode-cli');
+    assert.ok(models.includes('opencode/minimax-m2.5-free'));
+  });
+
+  it('opencode-cli models match OPENCODE_FREE_MODELS', () => {
+    const models = listProviderModels('opencode-cli');
+    assert.deepEqual(models, [...OPENCODE_FREE_MODELS]);
+  });
+
+  it('returns non-empty array for claude-cli', () => {
+    const models = listProviderModels('claude-cli');
+    assert.ok(Array.isArray(models));
+    assert.ok(models.length > 0);
+  });
+
+  it('claude-cli models are strings', () => {
+    const models = listProviderModels('claude-cli');
+    assert.ok(models.every(m => typeof m === 'string' && m.length > 0));
+  });
+
+  it('returns non-empty array for codex-cli', () => {
+    const models = listProviderModels('codex-cli');
+    assert.ok(Array.isArray(models));
+    assert.ok(models.length > 0);
+  });
+
+  it('returns empty array for unknown provider', () => {
+    const models = listProviderModels('unknown-provider');
+    assert.deepEqual(models, []);
   });
 });

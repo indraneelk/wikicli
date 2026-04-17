@@ -12,6 +12,7 @@ import { graphCommand } from "./commands/graph.js";
 import { statusCommand } from "./commands/status.js";
 import { removeCommand } from "./commands/remove.js";
 import { contradictionsCommand } from "./commands/contradictions.js";
+import { modelsCommand } from "./commands/models.js";
 
 const program = new Command();
 
@@ -31,5 +32,6 @@ program.addCommand(graphCommand);
 program.addCommand(statusCommand);
 program.addCommand(removeCommand);
 program.addCommand(contradictionsCommand);
+program.addCommand(modelsCommand);
 
 program.parse();

@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "fs";
+import { readFileSync, existsSync, writeFileSync } from "fs";
 import { join } from "path";
 import { parse as parseYaml } from "yaml";
 
@@ -66,6 +66,11 @@ export function loadConfig(dir: string = process.cwd()): WikicConfig {
     llm: { ...DEFAULT_CONFIG.llm, ...parsed?.llm },
     compiler: { ...DEFAULT_CONFIG.compiler, ...parsed?.compiler },
   };
+}
+
+export function saveConfig(dir: string, config: WikicConfig): void {
+  const configPath = join(dir, "config.yaml");
+  writeFileSync(configPath, configToYaml(config), "utf-8");
 }
 
 export function configToYaml(config: WikicConfig): string {
